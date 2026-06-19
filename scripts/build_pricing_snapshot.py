@@ -20,7 +20,14 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from traccia.pricing_normalizer import normalize
+# Repo root is the traccia package source tree (see pyproject package-dir).
+# When run as `python scripts/build_pricing_snapshot.py` the package is not
+# installed yet, so import the module directly from source.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from pricing_normalizer import normalize
 
 LITELLM_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/"
@@ -28,7 +35,6 @@ LITELLM_URL = (
 )
 
 # Where the snapshot lives relative to this script's repo root.
-REPO_ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT_PATH = REPO_ROOT / "data" / "pricing_snapshot.json"
 
 
