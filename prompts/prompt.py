@@ -10,6 +10,7 @@ from traccia.prompts.compile import CompileError, compile_body
 
 logger = logging.getLogger("traccia.prompts")
 
+ATTR_PROMPT_ID = "traccia.prompt.id"
 ATTR_PROMPT_NAME = "traccia.prompt.name"
 ATTR_PROMPT_VERSION = "traccia.prompt.version"
 ATTR_PROMPT_VERSION_ID = "traccia.prompt.version_id"
@@ -26,6 +27,7 @@ class LoadedPrompt:
         name: str,
         prompt_type: str,
         body: Mapping[str, Any],
+        prompt_id: Optional[str] = None,
         version: Optional[int] = None,
         version_id: Optional[str] = None,
         label: Optional[str] = None,
@@ -38,6 +40,7 @@ class LoadedPrompt:
         self.name = name
         self.type = prompt_type
         self.body = dict(body or {})
+        self.id = prompt_id
         self.version = version
         self.version_id = version_id
         self.label = label
@@ -59,6 +62,7 @@ class LoadedPrompt:
             name=str(payload.get("name") or ""),
             prompt_type=str(payload.get("type") or "text"),
             body=payload.get("body") or {},
+            prompt_id=str(payload["id"]) if payload.get("id") is not None else None,
             version=payload.get("version"),
             version_id=str(payload["version_id"]) if payload.get("version_id") is not None else None,
             label=payload.get("label"),
@@ -86,6 +90,7 @@ class LoadedPrompt:
             name=name,
             prompt_type=fb_type,
             body=body,
+            prompt_id=str(fallback["id"]) if fallback.get("id") is not None else None,
             version=fallback.get("version"),
             version_id=fallback.get("version_id"),
             label=label or fallback.get("label"),
@@ -109,6 +114,8 @@ class LoadedPrompt:
 
     def span_attributes(self) -> Dict[str, Any]:
         attrs: Dict[str, Any] = {ATTR_PROMPT_NAME: self.name}
+        if self.id:
+            attrs[ATTR_PROMPT_ID] = self.id
         if self.version is not None:
             attrs[ATTR_PROMPT_VERSION] = str(self.version)
         if self.version_id:
@@ -174,6 +181,7 @@ class LoadedPrompt:
 __all__ = [
     "LoadedPrompt",
     "CompileError",
+    "ATTR_PROMPT_ID",
     "ATTR_PROMPT_NAME",
     "ATTR_PROMPT_VERSION",
     "ATTR_PROMPT_VERSION_ID",
