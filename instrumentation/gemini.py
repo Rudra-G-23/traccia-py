@@ -1,0 +1,258 @@
+"""Gemini (google-genai) monkey patching for interactions.create."""
+
+from __future__ import annotations
+
+import time
+
+from traccia.tracer.span import SpanStatus
+
+_patched = False
+
+
+def _compute_cost(model, prompt_tokens, completion_tokens):
+    """Compute cost from token usage using pricing config."""
+    if not model or prompt_tokens is None or completion_tokens is None:
+        return None
+    try:
+        from traccia.pricing_config import load_pricing
+        from traccia.processors.cost_engine import compute_cost as _compute
+
+        return _compute(model, prompt_tokens, completion_tokens, load_pricing())
+    except Exception:
+        return None
+
+
+def _record_llm_metrics(model, input_tokens, output_tokens, duration, cost):
+    """Record LLM metrics if metrics are enabled."""
+    try:
+        from traccia.metrics.recorder import get_metrics_recorder
+
+        recorder = get_metrics_recorder()
+        if not recorder:
+            return
+        attributes = {"gen_ai.system": "google_gemini"}
+        if model:
+            attributes["gen_ai.request.model"] = model
+        try:
+            from traccia import runtime_config as _rc
+
+            _aid = _rc.get_agent_id()
+            _aname = _rc.get_agent_name()
+            _env = _rc.get_env()
+            if _aid:
+                attributes["agent.id"] = _aid
+                attributes["agent_id"] = _aid
+            if _aname:
+                attributes["agent.name"] = _aname
+            if _env:
+                attributes["environment"] = _env
+        except Exception:
+            pass
+        if input_tokens is not None or output_tokens is not None:
+            recorder.record_token_usage(
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+                attributes=attributes,
+            )
+        if duration is not None:
+            recorder.record_duration(duration, attributes=attributes)
+        if cost is not None:
+            recorder.record_cost(cost, attributes=attributes)
+    except Exception:
+        pass
+
+
+def _safe_get(obj, attr, default=None):
+    """Safely get a nested attribute or dict key (dot-separated path)."""
+    cur = obj
+    for part in attr.split("."):
+        if cur is None:
+            return default
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            cur = getattr(cur, part, None)
+    return cur if cur is not None else default
+
+
+def _extract_usage(resp):
+    """Return (input_tokens, output_tokens, thought_tokens) from a Gemini Interaction."""
+    usage = _safe_get(resp, "usage")
+    if usage is None:
+        return None, None, None
+    input_tokens = _safe_get(usage, "total_input_tokens") or _safe_get(
+        usage, "input_tokens"
+    )
+    output_tokens = _safe_get(usage, "total_output_tokens") or _safe_get(
+        usage, "output_tokens"
+    )
+    thought_tokens = _safe_get(usage, "total_thought_tokens")
+    return input_tokens, output_tokens, thought_tokens
+
+
+def _populate_span(span, resp, model, t0):
+    """Write all Interaction fields into the current span, then record metrics."""
+    input_tok, output_tok, thought_tok = _extract_usage(resp)
+
+    # Token attributes — OpenAI-compatible aliases so downstream processors work
+    if input_tok is not None:
+        span.set_attribute("llm.usage.prompt_tokens", input_tok)
+        span.set_attribute("llm.usage.input_tokens", input_tok)
+        span.set_attribute("llm.usage.prompt_source", "provider_usage")
+    if output_tok is not None:
+        span.set_attribute("llm.usage.completion_tokens", output_tok)
+        span.set_attribute("llm.usage.output_tokens", output_tok)
+        span.set_attribute("llm.usage.completion_source", "provider_usage")
+    if thought_tok is not None:
+        span.set_attribute("llm.usage.thought_tokens", thought_tok)
+    if input_tok is not None and output_tok is not None:
+        span.set_attribute("llm.usage.total_tokens", input_tok + output_tok)
+        span.set_attribute("llm.usage.source", "provider_usage")
+
+    # Output text (first 4 KB)
+    output_text = _safe_get(resp, "output_text")
+    if output_text:
+        span.set_attribute("llm.completion", str(output_text)[:4096])
+
+    # Interaction / request identifiers
+    interaction_id = _safe_get(resp, "id")
+    if interaction_id:
+        span.set_attribute("llm.interaction_id", str(interaction_id))
+
+    # Status (completed / failed / etc.)
+    status = _safe_get(resp, "status")
+    if status:
+        span.set_attribute("llm.response.status", str(status))
+
+    # Agent field — non-null means an agent ran the interaction
+    agent = _safe_get(resp, "agent")
+    if agent is not None:
+        span.set_attribute("llm.is_agent_run", True)
+
+    # Metrics
+    duration_val = time.perf_counter() - t0
+    cost_val = _compute_cost(model, input_tok, output_tok)
+    _record_llm_metrics(
+        model=model,
+        input_tokens=input_tok,
+        output_tokens=output_tok,
+        duration=duration_val,
+        cost=cost_val,
+    )
+
+
+def _record_exception_metric(model):
+    """Fire a single exception counter metric on error."""
+    try:
+        from traccia.metrics.recorder import get_metrics_recorder
+
+        rec = get_metrics_recorder()
+        if rec:
+            rec.record_exception(
+                attributes={
+                    "gen_ai.system": "google_gemini",
+                    "gen_ai.request.model": model or "unknown",
+                }
+            )
+    except Exception:
+        pass
+
+
+def _build_sync_wrapper(original_create):
+    """Return a sync wrapper around the original Interactions.create."""
+
+    def sync_wrapped(self, *args, **kwargs):
+        tracer = _get_tracer("gemini")
+        model = kwargs.get("model") or _safe_get(args[0] if args else None, "model")
+        attributes = {"llm.vendor": "google_gemini"}
+        if model:
+            attributes["llm.model"] = model
+        t0 = time.perf_counter()
+        with tracer.start_as_current_span(
+            "llm.gemini.interaction", attributes=attributes
+        ) as span:
+            try:
+                resp = original_create(self, *args, **kwargs)
+                _populate_span(span, resp, model, t0)
+                return resp
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(SpanStatus.ERROR, str(exc))
+                _record_exception_metric(model)
+                raise
+
+    sync_wrapped._agent_trace_patched = True
+    return sync_wrapped
+
+
+def _build_async_wrapper(original_create):
+    """Return an async wrapper around the original AsyncInteractions.create."""
+
+    async def async_wrapped(self, *args, **kwargs):
+        tracer = _get_tracer("gemini")
+        model = kwargs.get("model") or _safe_get(args[0] if args else None, "model")
+        attributes = {"llm.vendor": "google_gemini"}
+        if model:
+            attributes["llm.model"] = model
+        t0 = time.perf_counter()
+        with tracer.start_as_current_span(
+            "llm.gemini.interaction", attributes=attributes
+        ) as span:
+            try:
+                resp = await original_create(self, *args, **kwargs)
+                _populate_span(span, resp, model, t0)
+                return resp
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(SpanStatus.ERROR, str(exc))
+                _record_exception_metric(model)
+                raise
+
+    async_wrapped._agent_trace_patched = True
+    return async_wrapped
+
+
+def patch_gemini():
+    """Patch google-genai interactions.create (sync + async); returns True if patched."""
+    global _patched
+    if _patched:
+        return True
+    try:
+        import google.genai  # noqa: F401
+    except Exception:
+        # google-genai not installed — silently skip
+        return False
+
+    patched_any = False
+
+    # sync
+    try:
+        from google.genai.resources.interactions import Interactions
+
+        orig_sync = getattr(Interactions, "create", None)
+        if orig_sync and not getattr(orig_sync, "_agent_trace_patched", False):
+            Interactions.create = _build_sync_wrapper(orig_sync)
+            patched_any = True
+    except Exception:
+        pass
+
+    # async
+    try:
+        from google.genai.resources.interactions import AsyncInteractions
+
+        orig_async = getattr(AsyncInteractions, "create", None)
+        if orig_async and not getattr(orig_async, "_agent_trace_patched", False):
+            AsyncInteractions.create = _build_async_wrapper(orig_async)
+            patched_any = True
+    except Exception:
+        pass
+
+    if patched_any:
+        _patched = True
+    return _patched
+
+
+def _get_tracer(name):
+    import traccia
+
+    return traccia.get_tracer(name)

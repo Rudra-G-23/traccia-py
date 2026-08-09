@@ -11,7 +11,7 @@ from typing import Optional, Any
 
 from traccia.exporter import ConsoleExporter, FileExporter, OTLPExporter
 from traccia.config import DEFAULT_OTLP_TRACE_ENDPOINT
-from traccia.instrumentation import patch_anthropic, patch_openai, patch_requests
+from traccia.instrumentation import patch_anthropic, patch_gemini, patch_openai, patch_requests
 from traccia.processors import (
     BatchSpanProcessor,
     Sampler,
@@ -738,6 +738,10 @@ def start_tracing(
             pass
         try:
             patch_anthropic()
+        except Exception:
+            pass
+        try:
+            patch_gemini()
         except Exception:
             pass
         try:
