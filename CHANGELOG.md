@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.26] - 2026-08-09
+
+### Fixed
+- `LoadedPrompt.compile` now stamps `traccia.prompt.id` on the active span (with name, version, version_id, label, is_fallback). Prompt Metrics joins prefer this id over name-only matching.
+
 ## [0.1.25] - 2026-07-16
 
 ### Added
