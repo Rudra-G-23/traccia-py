@@ -213,45 +213,63 @@ def _build_async_wrapper(original_create):
 
 
 def patch_gemini():
-    """Patch google-genai interactions.create (sync + async); returns True if patched."""
+    """Patch google-genai interactions.create (sync+async); returns True if patched.
+
+    Tries two SDK layouts in priority order:
+      SDK >=2.x: google.genai._gaos.google_genai  (GeminiNextGenInteractions)
+      SDK  <2.x: google.genai.resources.interactions  (Interactions)
+    """
     global _patched
     if _patched:
         return True
     try:
         import google.genai  # noqa: F401
     except Exception:
-        # google-genai not installed — silently skip
-        return False
+        return False  # google-genai not installed
 
+    import importlib
     patched_any = False
 
-    # sync
-    try:
-        from google.genai.resources.interactions import Interactions
+    _CANDIDATES = [
+        ("google.genai._gaos.google_genai",
+         "GeminiNextGenInteractions",
+         "AsyncGeminiNextGenInteractions"),
+        ("google.genai.resources.interactions",
+         "Interactions",
+         "AsyncInteractions"),
+    ]
 
-        orig_sync = getattr(Interactions, "create", None)
-        if orig_sync and not getattr(orig_sync, "_agent_trace_patched", False):
-            Interactions.create = _build_sync_wrapper(orig_sync)
+    for mod_path, sync_name, async_name in _CANDIDATES:
+        try:
+            mod = importlib.import_module(mod_path)
+        except Exception:
+            continue  # not present in this SDK version
+
+        hit = False
+        try:
+            sync_cls = getattr(mod, sync_name, None)
+            if sync_cls is not None:
+                orig = getattr(sync_cls, "create", None)
+                if orig and not getattr(orig, "_agent_trace_patched", False):
+                    setattr(sync_cls, "create", _build_sync_wrapper(orig))
+                    hit = True
+
+            async_cls = getattr(mod, async_name, None)
+            if async_cls is not None:
+                orig = getattr(async_cls, "create", None)
+                if orig and not getattr(orig, "_agent_trace_patched", False):
+                    setattr(async_cls, "create", _build_async_wrapper(orig))
+                    hit = True
+        except Exception:
+            continue
+
+        if hit:
             patched_any = True
-    except Exception:
-        pass
-
-    # async
-    try:
-        from google.genai.resources.interactions import AsyncInteractions
-
-        orig_async = getattr(AsyncInteractions, "create", None)
-        if orig_async and not getattr(orig_async, "_agent_trace_patched", False):
-            AsyncInteractions.create = _build_async_wrapper(orig_async)
-            patched_any = True
-    except Exception:
-        pass
+            break
 
     if patched_any:
         _patched = True
     return _patched
-
-
 def _get_tracer(name):
     import traccia
 

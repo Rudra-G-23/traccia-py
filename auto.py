@@ -398,8 +398,8 @@ def start_tracing(
         os.environ.setdefault("AGENT_DASHBOARD_AGENT_CONFIG", agent_cfg_path)
 
     provider = _get_provider()
-    key = env_cfg.get("api_key") or api_key
-    endpoint = env_cfg.get("endpoint") or endpoint
+    key = env_cfg.get("api_key") or env_cfg.get("tracing", {}).get("api_key") or api_key
+    endpoint = env_cfg.get("endpoint") or env_cfg.get("tracing", {}).get("endpoint") or endpoint
     try:
         sample_rate = float(env_cfg.get("sample_rate", sample_rate))
     except Exception:

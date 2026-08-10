@@ -20,7 +20,7 @@ fake_usage = types.SimpleNamespace(
 )
 fake_response = types.SimpleNamespace(
     id="test-001",
-    model="gemini-2.0-flash",
+    model="models/gemini-flash-latest",
     status="completed",
     output_text="The capital of France is Paris.",
     usage=fake_usage,
@@ -61,7 +61,7 @@ print("-" * 60)
 
 client = FakeClient(api_key="fake-key")
 response = client.interactions.create(
-    model="gemini-2.0-flash",
+    model="models/gemini-flash-latest",
     input="What is the capital of France?",
 )
 
