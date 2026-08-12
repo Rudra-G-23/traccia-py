@@ -76,23 +76,55 @@ def _safe_get(obj, attr, default=None):
 
 
 def _extract_usage(resp):
-    """Return (input_tokens, output_tokens, thought_tokens) from a Gemini Interaction."""
+    """Return (input, output, thought, cached, tool_use, total) tokens from a Gemini Interaction."""
     usage = _safe_get(resp, "usage")
     if usage is None:
-        return None, None, None
-    input_tokens = _safe_get(usage, "total_input_tokens") or _safe_get(
-        usage, "input_tokens"
-    )
-    output_tokens = _safe_get(usage, "total_output_tokens") or _safe_get(
-        usage, "output_tokens"
-    )
+        return None, None, None, None, None, None
+
+    input_tokens = _safe_get(usage, "total_input_tokens")
+    if input_tokens is None:
+        input_tokens = _safe_get(usage, "input_tokens")
+        
+    output_tokens = _safe_get(usage, "total_output_tokens")
+    if output_tokens is None:
+        output_tokens = _safe_get(usage, "output_tokens")
+        
     thought_tokens = _safe_get(usage, "total_thought_tokens")
-    return input_tokens, output_tokens, thought_tokens
+    cached_tokens = _safe_get(usage, "total_cached_tokens")
+    tool_use_tokens = _safe_get(usage, "total_tool_use_tokens")
+    total_tokens = _safe_get(usage, "total_tokens")
+
+    return (
+        input_tokens,
+        output_tokens,
+        thought_tokens,
+        cached_tokens,
+        tool_use_tokens,
+        total_tokens,
+    )
+
+
+def _extract_prompt(kwargs, args):
+    """Return the request's `input` field as prompt text, if present."""
+    obj = args[0] if args else None
+    prompt = kwargs.get("input")
+    if prompt is None:
+        prompt = _safe_get(obj, "input")
+    if prompt is None:
+        return None
+    return str(prompt)
 
 
 def _populate_span(span, resp, model, t0):
     """Write all Interaction fields into the current span, then record metrics."""
-    input_tok, output_tok, thought_tok = _extract_usage(resp)
+    
+    if not model:
+        resp_model = _safe_get(resp, "model")
+        if resp_model and "llm.model" not in span.attributes:
+            span.set_attribute("llm.model", str(resp_model))
+        model = resp_model or model
+
+    input_tok, output_tok, thought_tok, cached_tok, tool_use_tok, total_tok = _extract_usage(resp)
 
     # Token attributes — OpenAI-compatible aliases so downstream processors work
     if input_tok is not None:
@@ -105,7 +137,16 @@ def _populate_span(span, resp, model, t0):
         span.set_attribute("llm.usage.completion_source", "provider_usage")
     if thought_tok is not None:
         span.set_attribute("llm.usage.thought_tokens", thought_tok)
-    if input_tok is not None and output_tok is not None:
+    if cached_tok is not None:
+        span.set_attribute("llm.usage.cached_tokens", cached_tok)
+    if tool_use_tok is not None:
+        span.set_attribute("llm.usage.tool_use_tokens", tool_use_tok)
+
+    # This is fallback if the provider didn't send one.
+    if total_tok is not None:
+        span.set_attribute("llm.usage.total_tokens", total_tok)
+        span.set_attribute("llm.usage.source", "provider_usage")
+    elif input_tok is not None and output_tok is not None:
         span.set_attribute("llm.usage.total_tokens", input_tok + output_tok)
         span.set_attribute("llm.usage.source", "provider_usage")
 
@@ -167,13 +208,31 @@ def _build_sync_wrapper(original_create):
         attributes = {"llm.vendor": "google_gemini"}
         if model:
             attributes["llm.model"] = model
+
+        prompt_text = _extract_prompt(kwargs, args)
+        if prompt_text:
+            attributes["llm.prompt"] = prompt_text[:4096]
+
+        previous_interaction_id = kwargs.get("previous_interaction_id") or _safe_get(
+            args[0] if args else None, "previous_interaction_id"
+        )
+        if previous_interaction_id:
+            attributes["llm.previous_interaction_id"] = str(previous_interaction_id)
+
+        streaming = kwargs.get("stream") is True or (
+            _safe_get(args[0] if args else None, "stream") is True
+        )
+        if streaming:
+            attributes["llm.streaming"] = True
+
         t0 = time.perf_counter()
         with tracer.start_as_current_span(
             "llm.gemini.interaction", attributes=attributes
         ) as span:
             try:
                 resp = original_create(self, *args, **kwargs)
-                _populate_span(span, resp, model, t0)
+                if not streaming:
+                    _populate_span(span, resp, model, t0)
                 return resp
             except Exception as exc:
                 span.record_exception(exc)
@@ -194,13 +253,31 @@ def _build_async_wrapper(original_create):
         attributes = {"llm.vendor": "google_gemini"}
         if model:
             attributes["llm.model"] = model
+
+        prompt_text = _extract_prompt(kwargs, args)
+        if prompt_text:
+            attributes["llm.prompt"] = prompt_text[:4096]
+
+        previous_interaction_id = kwargs.get("previous_interaction_id") or _safe_get(
+            args[0] if args else None, "previous_interaction_id"
+        )
+        if previous_interaction_id:
+            attributes["llm.previous_interaction_id"] = str(previous_interaction_id)
+
+        streaming = kwargs.get("stream") is True or (
+            _safe_get(args[0] if args else None, "stream") is True
+        )
+        if streaming:
+            attributes["llm.streaming"] = True
+
         t0 = time.perf_counter()
         with tracer.start_as_current_span(
             "llm.gemini.interaction", attributes=attributes
         ) as span:
             try:
                 resp = await original_create(self, *args, **kwargs)
-                _populate_span(span, resp, model, t0)
+                if not streaming: 
+                    _populate_span(span, resp, model, t0)
                 return resp
             except Exception as exc:
                 span.record_exception(exc)
