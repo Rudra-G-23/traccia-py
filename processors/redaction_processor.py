@@ -64,12 +64,19 @@ DEFAULT_SENSITIVE_KEY_FRAGMENTS: FrozenSet[str] = frozenset(
     )
 )
 
-# Prompt identity attrs contain the substring "prompt" but must not be redacted.
+# Prompt / eval identity attrs contain substrings that would otherwise redact.
 PROMPT_IDENTITY_KEY_PREFIX = "traccia.prompt."
+_EVAL_ALLOWLIST_PREFIXES = (
+    "traccia.prompt.",
+    "traccia.experiment.",
+    "traccia.eval.",
+    "traccia.dataset.",
+)
 
 
 def _key_is_allowlisted(key: str) -> bool:
-    return key.lower().startswith(PROMPT_IDENTITY_KEY_PREFIX)
+    lower = key.lower()
+    return any(lower.startswith(p) for p in _EVAL_ALLOWLIST_PREFIXES)
 
 
 def _key_is_sensitive(key: str, fragments: Iterable[str]) -> bool:
