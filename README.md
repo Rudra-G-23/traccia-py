@@ -158,7 +158,7 @@ result = llm.invoke(
 )
 ```
 
-Spans for LLM/chat model runs are created automatically with the same attributes as direct OpenAI instrumentation (model, prompt, usage, cost).
+Spans for LLM/chat model runs are created automatically with the same attributes as direct OpenAI instrumentation (model, prompt, usage, cost). Chain/graph runs (e.g. LangGraph nodes, `RunnableSequence`, prompt templates) and tool calls are also traced as nested spans, mirroring the LangChain/LangGraph execution hierarchy.
 
 **Note:** `pip install traccia[langchain]` installs traccia plus `langchain-core`; you need this extra to use the callback handler. If you already have `langchain-core` (e.g. from `langchain` or `langchain-openai`), base `pip install traccia` may be enough at runtime, but `traccia[langchain]` is the supported way to get a compatible dependency.
 

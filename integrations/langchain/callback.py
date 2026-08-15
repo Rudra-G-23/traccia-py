@@ -60,14 +60,12 @@ class TracciaCallbackHandler(BaseCallbackHandler):
         super().__init__()
         self.tracer = get_tracer("traccia.langchain")
         
-        # Track active spans by run_id
+        # Track active spans by run_id (chain, tool, and LLM spans alike,
+        # so any span type can be looked up as a parent for nesting)
         self._spans: Dict[UUID, Any] = {}
         self._context_tokens: Dict[UUID, Any] = {}
         self._span_start_times: Dict[UUID, float] = {}
-        
-        # Track parent relationships
-        self._parent_map: Dict[UUID, Optional[UUID]] = {}
-    
+
     def on_llm_start(
         self,
         serialized: Dict[str, Any],
@@ -80,18 +78,17 @@ class TracciaCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         """Handle LLM start event."""
-        self._parent_map[run_id] = parent_run_id
-        
         try:
             # Extract attributes
             attributes = self._build_llm_attributes(
                 serialized, prompts, None, kwargs, metadata
             )
-            
-            # Start span
+
+            # Start span, nested under its chain/tool parent span if any
             span = self.tracer.start_as_current_span(
                 "llm.langchain.run",
-                attributes=attributes
+                attributes=attributes,
+                parent=self._spans.get(parent_run_id),
             )
             
             # Store span and start time for metrics
@@ -116,24 +113,23 @@ class TracciaCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         """Handle chat model start event."""
-        self._parent_map[run_id] = parent_run_id
-        
         try:
             # Convert messages to prompt format
             message_dicts = []
             for msg_list in messages:
                 for msg in msg_list:
                     message_dicts.append(self._convert_message_to_dict(msg))
-            
+
             # Extract attributes
             attributes = self._build_llm_attributes(
                 serialized, None, message_dicts, kwargs, metadata
             )
-            
-            # Start span
+
+            # Start span, nested under its chain/tool parent span if any
             span = self.tracer.start_as_current_span(
                 "llm.langchain.run",
-                attributes=attributes
+                attributes=attributes,
+                parent=self._spans.get(parent_run_id),
             )
             
             # Store span and start time for metrics
@@ -167,12 +163,11 @@ class TracciaCallbackHandler(BaseCallbackHandler):
             
             # End span
             span.__exit__(None, None, None)
-            
+
             # Clean up context
             self._context_tokens.pop(run_id, None)
-            self._parent_map.pop(run_id, None)
             self._span_start_times.pop(run_id, None)
-            
+
         except Exception as e:
             import logging
             logging.getLogger(__name__).exception(f"Error in on_llm_end: {e}")
@@ -200,16 +195,15 @@ class TracciaCallbackHandler(BaseCallbackHandler):
             
             # End span
             span.__exit__(type(error), error, None)
-            
+
             # Clean up
             self._context_tokens.pop(run_id, None)
-            self._parent_map.pop(run_id, None)
             self._span_start_times.pop(run_id, None)
-            
+
         except Exception as e:
             import logging
             logging.getLogger(__name__).exception(f"Error in on_llm_error: {e}")
-    
+
     def on_chain_start(
         self,
         serialized: Dict[str, Any],
@@ -221,10 +215,24 @@ class TracciaCallbackHandler(BaseCallbackHandler):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        """Handle chain start event (optional Phase 2)."""
-        self._parent_map[run_id] = parent_run_id
-        # Phase 2: Can add chain spans here
-    
+        """Handle chain start event: create a span for the chain/graph node."""
+        try:
+            name = self._extract_chain_name(serialized, kwargs, metadata)
+            attributes = {
+                "langchain.type": "chain",
+                "chain.name": name,
+                "span.type": "span",
+            }
+            span = self.tracer.start_as_current_span(
+                f"chain.langchain.{name}",
+                attributes=attributes,
+                parent=self._spans.get(parent_run_id),
+            )
+            self._spans[run_id] = span
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(f"Error in on_chain_start: {e}")
+
     def on_chain_end(
         self,
         outputs: Dict[str, Any],
@@ -233,10 +241,16 @@ class TracciaCallbackHandler(BaseCallbackHandler):
         parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
-        """Handle chain end event (optional Phase 2)."""
-        self._parent_map.pop(run_id, None)
-        # Phase 2: Can end chain spans here
-    
+        """Handle chain end event: close the chain's span."""
+        try:
+            span = self._spans.pop(run_id, None)
+            if span is None:
+                return
+            span.__exit__(None, None, None)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(f"Error in on_chain_end: {e}")
+
     def on_chain_error(
         self,
         error: BaseException,
@@ -245,10 +259,129 @@ class TracciaCallbackHandler(BaseCallbackHandler):
         parent_run_id: Optional[UUID] = None,
         **kwargs: Any,
     ) -> None:
-        """Handle chain error event (optional Phase 2)."""
-        self._parent_map.pop(run_id, None)
-        # Phase 2: Can handle chain errors here
-    
+        """Handle chain error event: record the exception and close the span."""
+        try:
+            span = self._spans.pop(run_id, None)
+            if span is None:
+                return
+            span._otel_span.record_exception(error)
+            span.set_status(SpanStatus.ERROR, str(error))
+            span.__exit__(type(error), error, None)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(f"Error in on_chain_error: {e}")
+
+    def on_tool_start(
+        self,
+        serialized: Dict[str, Any],
+        input_str: str,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Handle tool start event: create a span for the tool call."""
+        try:
+            name = self._extract_tool_name(serialized, kwargs)
+            attributes = {
+                "langchain.type": "tool",
+                "tool.name": name,
+                "span.type": "TOOL",
+                "tool.input": str(input_str)[:1000],
+            }
+            span = self.tracer.start_as_current_span(
+                f"tool.langchain.{name}",
+                attributes=attributes,
+                parent=self._spans.get(parent_run_id),
+            )
+            self._spans[run_id] = span
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(f"Error in on_tool_start: {e}")
+
+    def on_tool_end(
+        self,
+        output: Any,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Handle tool end event: close the tool's span."""
+        try:
+            span = self._spans.pop(run_id, None)
+            if span is None:
+                return
+            span.set_attribute("tool.output", str(output)[:1000])
+            span.__exit__(None, None, None)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(f"Error in on_tool_end: {e}")
+
+    def on_tool_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Handle tool error event: record the exception and close the span."""
+        try:
+            span = self._spans.pop(run_id, None)
+            if span is None:
+                return
+            span._otel_span.record_exception(error)
+            span.set_status(SpanStatus.ERROR, str(error))
+            span.__exit__(type(error), error, None)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(f"Error in on_tool_error: {e}")
+
+    def _extract_chain_name(
+        self,
+        serialized: Optional[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+    ) -> str:
+        """Extract a human-readable name for a chain/runnable span."""
+        if metadata:
+            node = metadata.get("langgraph_node")
+            if node:
+                return str(node)
+        name = kwargs.get("name")
+        if name:
+            return str(name)
+        if serialized:
+            name = serialized.get("name")
+            if name:
+                return str(name)
+            id_list = serialized.get("id")
+            if isinstance(id_list, list) and id_list:
+                return str(id_list[-1])
+        return "chain"
+
+    def _extract_tool_name(
+        self,
+        serialized: Optional[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+    ) -> str:
+        """Extract a human-readable name for a tool span."""
+        name = kwargs.get("name")
+        if name:
+            return str(name)
+        if serialized:
+            name = serialized.get("name")
+            if name:
+                return str(name)
+            id_list = serialized.get("id")
+            if isinstance(id_list, list) and id_list:
+                return str(id_list[-1])
+        return "tool"
+
     def _build_llm_attributes(
         self,
         serialized: Dict[str, Any],
