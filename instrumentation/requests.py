@@ -8,6 +8,24 @@ from traccia.context import get_current_span, inject_traceparent, inject_tracest
 
 _patched = False
 
+# Skip instrumentation for Traccia platform HTTP — avoids feedback loops (OTLP)
+# and eval bookkeeping traces (eval-runtime) polluting Observe.
+_SKIP_URL_SUBSTRINGS = (
+    "/v1/traces",
+    "/v2/traces",
+    "/api/v1/traces",
+    "/api/v2/traces",
+    "/v1/metrics",
+    "/v2/metrics",
+    "/api/v1/metrics",
+    "/api/v2/metrics",
+    "/api/v1/eval-runtime/",
+)
+
+
+def _should_skip_http_instrumentation(url: str) -> bool:
+    return any(path in url for path in _SKIP_URL_SUBSTRINGS)
+
 
 def patch_requests() -> bool:
     """Patch requests.Session.request; returns True if patched, False otherwise."""
@@ -25,17 +43,10 @@ def patch_requests() -> bool:
         return True
 
     def wrapped_request(self, method, url, *args, **kwargs):
-        # Skip instrumentation for trace/metrics ingestion endpoints to prevent feedback loop
         url_str = str(url) if url else ""
-        ingestion_paths = [
-            "/v1/traces", "/v2/traces", "/api/v1/traces", "/api/v2/traces",
-            "/v1/metrics", "/v2/metrics", "/api/v1/metrics", "/api/v2/metrics",
-        ]
-        if any(path in url_str for path in ingestion_paths):
-            # This is likely an exporter endpoint - don't instrument it
-            import requests
+        if _should_skip_http_instrumentation(url_str):
             return original_request(self, method, url, *args, **kwargs)
-        
+
         tracer = _get_tracer("requests")
         attributes: Dict[str, Any] = {
             "http.method": method,

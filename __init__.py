@@ -21,6 +21,7 @@ from traccia.prompts import (
     CompileError,
     PromptFetchError,
 )
+from traccia.eval import evaluate, EvaluateResult, EvaluateError
 
 # Version exposure
 try:
@@ -113,5 +114,8 @@ __all__ = [
     "LoadedPrompt",
     "CompileError",
     "PromptFetchError",
+    "evaluate",
+    "EvaluateResult",
+    "EvaluateError",
 ]
 

@@ -383,7 +383,8 @@ def start_tracing(
     if load_env:
         sdk_config.load_dotenv()
     
-    # Load config from environment as a flat dict — load_config_from_env()
+    # Flat dict — nested load_config_from_env() would hide api_key/endpoint
+    # under tracing.* and OTLP would export with no Authorization header.
     env_cfg = sdk_config.load_config_from_env(flat=True)
 
     # Apply any explicit overrides

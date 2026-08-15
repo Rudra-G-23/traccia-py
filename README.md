@@ -1,10 +1,10 @@
 # Traccia
 
-**OpenTelemetry-based observability, distributed tracing, governance, and compliance for AI agents and LLM applications**
+**OpenTelemetry-based observability, distributed tracing, evaluation, governance, and compliance for AI agents and LLM applications**
 
-Traccia is a production-ready Python SDK for observability, distributed tracing, governance, and compliance across AI agents, LLM applications, agentic workflows, and multi-agent systems.
+Traccia is a production-ready Python SDK for observability, distributed tracing, evaluation, governance, and compliance across AI agents, LLM applications, agentic workflows, and multi-agent systems.
 
-Built on OpenTelemetry standards, Traccia provides automatic instrumentation, token and cost tracking, guardrail detection, AI governance evidence, and OTLP-compatible exports for modern AI applications.
+Built on OpenTelemetry standards, Traccia provides automatic instrumentation, token and cost tracking, offline evaluation, guardrail detection, AI governance evidence, and OTLP-compatible exports for modern AI applications.
 
 [Traccia](https://pypi.org/project/traccia/) is available on PyPI.
 
@@ -24,6 +24,7 @@ Built on OpenTelemetry standards, Traccia provides automatic instrumentation, to
 - **High Performance**: Efficient batching, async support, and low-overhead instrumentation
 - **Security Controls**: No secrets in logs and configurable data truncation
 - **Prompt Management**: `load_prompt` / `prefetch_prompts` with cache, stale-while-revalidate, fallback, and `traccia.prompt.*` span identity
+- **Offline Evaluation**: `evaluate()` runs a task and scorers over a dataset and saves an experiment you can open, compare, and attach on promote
 
 ---
 
@@ -116,6 +117,40 @@ def reply(question: str) -> str:
 ```
 
 Requires the [Traccia platform](https://app.traccia.ai): create a workspace API key under **Settings → API Keys**. Tracing and prompt fetch use the same key and default to `https://api.traccia.ai`. Pass an explicit `fallback` so agents can still run if a fetch fails. See [Prompts in the SDK](https://traccia.ai/docs/sdk/prompts).
+
+### Run an experiment
+
+`evaluate()` runs a task and scorers over a dataset. By default the run is saved as an experiment you can open in the app under **Evaluate → Experiments**, compare against other runs, and attach when you promote a prompt. Use the same workspace API key as tracing and `load_prompt`.
+
+```python
+from traccia import init, evaluate, load_prompt
+
+init(api_key="...")
+
+prompt = load_prompt("support-reply", label="production")
+
+def task(inp):
+    messages = prompt.compile(**inp)
+    return call_model(messages)
+
+result = evaluate(
+    "support-reply-v3",
+    data="support-golden",     # platform dataset name or UUID
+    task=task,
+    scorers=["exact_match"],   # builtins, platform names/ids, or callables
+    prompt="support-reply",    # labels the experiment cell with this prompt
+)
+print(result.summary())
+print(result.url)
+```
+
+- **Persist is on by default.** Set `persist=False` for a local-only loop (no experiment URL).
+- **Inline rows** work as `[{"input": {...}, "expected": "..."}]`. With persist on, Traccia still saves a full experiment (helper datasets named `sdk-eval/...` are hidden on **Evaluate → Datasets** unless you turn on **Show SDK-Created**).
+- **Builtins** run in-process: `exact_match`, `contains`, `json_valid`. Mix in platform scorers (LLM-as-judge, code) by name or UUID. Pass `provider_keys=` for judges.
+- **One throwing row does not abort the run.** That cell records `error`; other items still score. Configuration and API failures raise `EvaluateError`.
+- If the first task argument is named `row`, `item`, `example`, or `case`, Python passes the full row. Any other name (including `input`) receives only the input dict.
+
+See [Evaluate in the SDK](https://traccia.ai/docs/sdk/evaluate) and the walkthrough [Run Experiments From Code](https://traccia.ai/docs/guides/sdk-evaluate).
 
 ### LangChain
 
@@ -1060,6 +1095,38 @@ prefetch_prompts(["support-reply"])
 prompt = load_prompt("support-reply", label="production", fallback={...})
 messages = prompt.compile(question=q)
 ```
+
+#### `evaluate(name, *, data, task, scorers=None, prompt=None, max_concurrency=10, persist=True, provider_keys=None, progress=True, ...) -> EvaluateResult`
+
+Run a task and scorers over a platform dataset or inline rows. Persists an experiment by default. See [Evaluate in the SDK](https://traccia.ai/docs/sdk/evaluate).
+
+```python
+from traccia import evaluate
+
+result = evaluate(
+    "support-reply-v3",
+    data="support-golden",
+    task=task,
+    scorers=["exact_match", "contains"],
+    prompt="support-reply",
+    persist=True,
+)
+print(result.summary())
+print(result.url)
+```
+
+**Parameters**:
+- `name` (str): Experiment name (required)
+- `data`: Dataset name/UUID, or a list of `{input, expected, metadata}` dicts (`expected_output` is an alias of `expected`)
+- `task`: Callable mapping each row to an output. First arg named `row` / `item` / `example` / `case` receives the full row; otherwise the input dict
+- `scorers`: Builtin ids (`exact_match`, `contains`, `json_valid`), platform names/ids, and/or callables `(input=, output=, expected=, metadata=)`
+- `prompt` (str, optional): Prompt name. Attaches version ids when persisting and labels the cell (otherwise `Task`)
+- `max_concurrency` (int): Parallel item workers (default 10)
+- `persist` (bool): Create an experiment (default True). Inline + persist creates `sdk-eval/<name>/<id>`
+- `provider_keys` (dict, optional): BYO keys for platform LLM-as-judge (`openai`, `anthropic`, `gemini`, `groq`)
+- `progress` (bool): Print `N/M` to stderr (default True)
+
+**Returns**: `EvaluateResult` with `rows`, `aggregates`, `summary()`, `url`, `experiment_id`, `dataset_id`, `errors`, `persist_error`. Empty data, bad config, and dataset/scorer API failures raise `EvaluateError`.
 
 #### `stop_tracing(flush_timeout: float = 1.0) -> None`
 

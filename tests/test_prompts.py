@@ -23,14 +23,7 @@ from traccia.prompts.compile import compile_body
 from traccia.processors.redaction_processor import redact_attributes
 
 
-FIXTURES = (
-    Path(__file__).resolve().parents[2]
-    / "docs"
-    / "implementation"
-    / "prompt-management"
-    / "scratch"
-    / "f49-compile-fixtures.json"
-)
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "compile-fixtures.json"
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +52,7 @@ def test_f49_fixtures_parity():
 def test_loaded_prompt_compile_text_and_attrs():
     prompt = LoadedPrompt.from_payload(
         {
+            "id": "pid-1",
             "name": "greet",
             "type": "text",
             "version": 3,
@@ -70,6 +64,7 @@ def test_loaded_prompt_compile_text_and_attrs():
     span = MagicMock()
     with patch("traccia.context.get_current_span", return_value=span):
         assert prompt.compile(name="Ada") == "Hi Ada"
+    span.set_attribute.assert_any_call("traccia.prompt.id", "pid-1")
     span.set_attribute.assert_any_call("traccia.prompt.name", "greet")
     span.set_attribute.assert_any_call("traccia.prompt.version", "3")
     span.set_attribute.assert_any_call("traccia.prompt.label", "production")
