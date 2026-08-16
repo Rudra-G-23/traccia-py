@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.28] - 2026-08-16
+
+### Added
+- Groq auto-instrumentation (`patch_groq`): patches `Groq`/`AsyncGroq` chat completions the same way as the OpenAI patch (OpenAI-compatible API), capturing `llm.vendor=groq`, model, truncated prompt/completion, and token usage; `stream=True` calls are left undrained, same as OpenAI
+
 ## [0.1.27] - 2026-08-14
 
 ### Added

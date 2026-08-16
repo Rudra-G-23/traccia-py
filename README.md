@@ -10,7 +10,7 @@ Built on OpenTelemetry standards, Traccia provides automatic instrumentation, to
 
 ## Features
 
-- **Automatic Instrumentation**: Auto-patch OpenAI, Anthropic, requests, and HTTP libraries
+- **Automatic Instrumentation**: Auto-patch OpenAI, Anthropic, Groq, requests, and HTTP libraries
 - **Framework Integrations**: Support for LangChain, CrewAI, and OpenAI Agents SDK
 - **LLM-Aware Tracing**: Track tokens, costs, prompts, completions, and latency automatically
 - **OpenTelemetry Metrics**: Emit OTEL-compliant metrics for accurate token and cost tracking independent of sampling
@@ -73,6 +73,21 @@ def generate_text(prompt: str) -> str:
 
 # Automatically tracks: model, tokens, cost, prompt, completion, latency
 text = generate_text("Write a haiku about Python")
+```
+
+Groq's SDK (`Groq` / `AsyncGroq`) is OpenAI-compatible and auto-patched the same way — just call `init()` before creating the client:
+
+```python
+from traccia import init
+from groq import Groq
+
+init()  # Auto-patches Groq
+
+client = Groq()
+response = client.chat.completions.create(
+    model="llama-3.3-70b-versatile",
+    messages=[{"role": "user", "content": "Write a haiku about Python"}]
+)
 ```
 
 ### Load a versioned prompt
@@ -377,7 +392,7 @@ file_exporter_path = "traces.jsonl"
 reset_trace_file = false      # Reset file on initialization
 
 [instrumentation]
-enable_patching = true          # Auto-patch libraries (OpenAI, Anthropic, requests)
+enable_patching = true          # Auto-patch libraries (OpenAI, Anthropic, Groq, requests)
 enable_token_counting = true    # Count tokens for LLM calls
 enable_costs = true             # Calculate costs
 openai_agents = true            # Auto-enable OpenAI Agents SDK integration
@@ -867,7 +882,7 @@ init(sample_rate=0.1)
 
 ### Token Counting & Cost Calculation
 
-Automatic for supported LLM providers (OpenAI, Anthropic):
+Automatic for supported LLM providers (OpenAI, Anthropic, Groq):
 
 ```python
 @observe(as_type="llm")
@@ -1028,7 +1043,7 @@ Initialize the Traccia SDK. All parameters are optional; configuration is merged
 - `reset_trace_file` (bool): Clear file on init (default: False)
 
 *Instrumentation*
-- `enable_patching` (bool): Auto-patch OpenAI, Anthropic, requests (default: True)
+- `enable_patching` (bool): Auto-patch OpenAI, Anthropic, Groq, requests (default: True)
 - `enable_token_counting` (bool): Count tokens (default: True)
 - `enable_costs` (bool): Calculate costs (default: True)
 - `pricing_override` (dict): Per-model pricing override — always wins over all other sources. See [Pricing](#pricing) section below.
@@ -1198,7 +1213,7 @@ Application Code (@observe)
 
 - **`traccia.instrumentation.*`**: Infrastructure and vendor instrumentation.
   - HTTP client/server helpers (including FastAPI middleware).
-  - Vendor SDK hooks and monkey patching (e.g., OpenAI, Anthropic, `requests`).
+  - Vendor SDK hooks and monkey patching (e.g., OpenAI, Anthropic, Groq, `requests`).
   - Decorators and utilities used for auto-instrumenting arbitrary functions.
 
 - **`traccia.integrations.*`**: AI/agent framework integrations.
