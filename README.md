@@ -10,7 +10,7 @@ Built on OpenTelemetry standards, Traccia provides automatic instrumentation, to
 
 ## Features
 
-- **Automatic Instrumentation**: Auto-patch OpenAI, Anthropic, requests, and HTTP libraries
+- **Automatic Instrumentation**: Auto-patch OpenAI, Anthropic, Gemini (google-genai), requests, and HTTP libraries
 - **Framework Integrations**: Support for LangChain, CrewAI, and OpenAI Agents SDK
 - **LLM-Aware Tracing**: Track tokens, costs, prompts, completions, and latency automatically
 - **OpenTelemetry Metrics**: Emit OTEL-compliant metrics for accurate token and cost tracking independent of sampling
@@ -74,6 +74,22 @@ def generate_text(prompt: str) -> str:
 # Automatically tracks: model, tokens, cost, prompt, completion, latency
 text = generate_text("Write a haiku about Python")
 ```
+
+### Gemini (google-genai)
+
+```python
+from traccia import init
+from google import genai
+
+init()  # Auto-patches google-genai
+
+client = genai.Client()
+response = client.interactions.create(
+    model="models/gemini-flash-latest",
+    input="Write a haiku about Python",
+)
+```
+
 
 ### Load a versioned prompt
 
@@ -1198,7 +1214,7 @@ Application Code (@observe)
 
 - **`traccia.instrumentation.*`**: Infrastructure and vendor instrumentation.
   - HTTP client/server helpers (including FastAPI middleware).
-  - Vendor SDK hooks and monkey patching (e.g., OpenAI, Anthropic, `requests`).
+  - Vendor SDK hooks and monkey patching (e.g., OpenAI, Anthropic, Gemini, `requests`).
   - Decorators and utilities used for auto-instrumenting arbitrary functions.
 
 - **`traccia.integrations.*`**: AI/agent framework integrations.

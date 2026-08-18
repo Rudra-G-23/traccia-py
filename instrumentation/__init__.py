@@ -8,6 +8,7 @@ auto-instrumentation.
 from traccia.instrumentation.decorator import observe
 from traccia.instrumentation.openai import patch_openai, patch_openai_responses
 from traccia.instrumentation.anthropic import patch_anthropic
+from traccia.instrumentation.gemini import patch_gemini
 from traccia.instrumentation.requests import patch_requests
 from traccia.instrumentation.http_client import inject_headers as inject_http_headers
 from traccia.instrumentation.http_server import extract_parent_context, start_server_span
@@ -18,6 +19,7 @@ __all__ = [
     "patch_openai",
     "patch_openai_responses",
     "patch_anthropic",
+    "patch_gemini",
     "patch_requests",
     "inject_http_headers",
     "extract_parent_context",

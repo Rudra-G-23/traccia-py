@@ -11,7 +11,7 @@ from typing import Optional, Any
 
 from traccia.exporter import ConsoleExporter, FileExporter, OTLPExporter
 from traccia.config import DEFAULT_OTLP_TRACE_ENDPOINT
-from traccia.instrumentation import patch_anthropic, patch_openai, patch_requests
+from traccia.instrumentation import patch_anthropic, patch_gemini, patch_openai, patch_requests
 from traccia.processors import (
     BatchSpanProcessor,
     Sampler,
@@ -386,7 +386,7 @@ def start_tracing(
     # Flat dict — nested load_config_from_env() would hide api_key/endpoint
     # under tracing.* and OTLP would export with no Authorization header.
     env_cfg = sdk_config.load_config_from_env(flat=True)
-    
+
     # Apply any explicit overrides
     if api_key:
         env_cfg['api_key'] = api_key
@@ -739,6 +739,10 @@ def start_tracing(
             pass
         try:
             patch_anthropic()
+        except Exception:
+            pass
+        try:
+            patch_gemini()
         except Exception:
             pass
         try:
@@ -1125,4 +1129,3 @@ def _install_integrations(
         except Exception:
             # CrewAI not installed or error during install, skip silently
             pass
-
