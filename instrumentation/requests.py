@@ -9,7 +9,8 @@ from traccia.context import get_current_span, inject_traceparent, inject_tracest
 _patched = False
 
 # Skip instrumentation for Traccia platform HTTP — avoids feedback loops (OTLP)
-# and eval bookkeeping traces (eval-runtime) polluting Observe.
+# and bookkeeping traces (eval/prompt/govern) polluting Observe.
+# Keep in sync with traccia-node `src/instrumentation/http-skip.ts`.
 _SKIP_URL_SUBSTRINGS = (
     "/v1/traces",
     "/v2/traces",
@@ -20,11 +21,20 @@ _SKIP_URL_SUBSTRINGS = (
     "/api/v1/metrics",
     "/api/v2/metrics",
     "/api/v1/eval-runtime/",
+    "/api/v1/prompt-runtime/",
+    "/api/v1/agents/",
 )
 
 
 def _should_skip_http_instrumentation(url: str) -> bool:
-    return any(path in url for path in _SKIP_URL_SUBSTRINGS)
+    if any(path in url for path in _SKIP_URL_SUBSTRINGS):
+        return True
+    normalized = url.rstrip("/")
+    if "/agents/" in url and (
+        normalized.endswith("/status") or "/blocks" in url
+    ):
+        return True
+    return False
 
 
 def patch_requests() -> bool:

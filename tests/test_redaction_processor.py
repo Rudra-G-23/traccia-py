@@ -71,3 +71,15 @@ def test_redaction_allowlists_traccia_prompt_identity():
     assert out["traccia.prompt.version_id"] == "uuid-1"
     assert out["traccia.prompt.label"] == "production"
     assert "[REDACTED_EMAIL]" in out["llm.prompt"]
+
+
+def test_redaction_allowlists_traccia_policy_effect():
+    attrs = {
+        "traccia.policy.effect": "deny",
+        "traccia.policy.matched": True,
+        "llm.prompt": "secret@example.com",
+    }
+    out = redact_attributes(attrs)
+    assert out["traccia.policy.effect"] == "deny"
+    assert out["traccia.policy.matched"] is True
+    assert "[REDACTED_EMAIL]" in out["llm.prompt"]

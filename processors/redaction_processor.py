@@ -68,6 +68,7 @@ DEFAULT_SENSITIVE_KEY_FRAGMENTS: FrozenSet[str] = frozenset(
 PROMPT_IDENTITY_KEY_PREFIX = "traccia.prompt."
 _EVAL_ALLOWLIST_PREFIXES = (
     "traccia.prompt.",
+    "traccia.policy.",
     "traccia.experiment.",
     "traccia.eval.",
     "traccia.dataset.",

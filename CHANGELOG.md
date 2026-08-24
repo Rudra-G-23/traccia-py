@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Redaction allowlist for `traccia.policy.*` span attributes (same pattern as `traccia.prompt.*`)
+- HTTP client skip for `@govern()` status/block calls and prompt-runtime fetches, matching the Node SDK
+
 ## [0.1.27] - 2026-08-14
 
 ### Added
