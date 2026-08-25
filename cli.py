@@ -8,6 +8,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Optional
 
 from traccia.config import (
@@ -527,6 +528,84 @@ def _pricing_clear(args) -> int:
     return 0
 
 
+def _copilot_install_hooks(args) -> int:
+    """Write a GitHub Copilot hooks config that routes lifecycle events to Traccia.
+
+    See docs.github.com/en/copilot/reference/hooks-reference for the config
+    format this generates, and docs/github-copilot-integration.md for why
+    each of these events is (or isn't) registered.
+    """
+    from traccia.integrations.github_copilot import mapping
+
+    if args.scope == "user":
+        target_dir = Path.home() / ".copilot" / "hooks"
+    else:
+        target_dir = Path.cwd() / ".github" / "hooks"
+    target_path = target_dir / "traccia.json"
+
+    if target_path.exists() and not args.force:
+        print(f"❌ Hook config already exists at {target_path}", file=sys.stderr)
+        print("   Use --force to overwrite", file=sys.stderr)
+        return 1
+
+    python_bin = args.python or sys.executable
+    events = sorted(mapping.ALL_KNOWN_EVENTS - mapping.IGNORED_EVENTS)
+    hook_config = {
+        "version": 1,
+        "disableAllHooks": False,
+        "hooks": {
+            event: [
+                {
+                    "type": "command",
+                    "command": f"{python_bin} -m traccia.integrations.github_copilot.hook {event}",
+                    "timeoutSec": 30,
+                }
+            ]
+            for event in events
+        },
+    }
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as f:
+            json.dump(hook_config, f, indent=2)
+            f.write("\n")
+    except OSError as exc:
+        print(f"❌ Failed to write hook config: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"✅ Wrote Copilot hook config to {target_path}")
+    print(f"   Registered events: {', '.join(events)}")
+    if args.scope == "repo":
+        print("   This must be committed and on the repository's default branch")
+        print("   for the GitHub-hosted coding agent to pick it up.")
+    print("\n📝 Next: run `traccia doctor` and start a Copilot CLI session to verify.")
+    print("   Sessions are exported once they end; use `traccia copilot flush --all`")
+    print("   to recover any session that ended without a clean sessionEnd event.")
+    return 0
+
+
+def _copilot_flush(args) -> int:
+    """Export any buffered GitHub Copilot session(s) and clear their local logs."""
+    from traccia.integrations.github_copilot.flush import flush_session, flush_all
+
+    if args.session:
+        summary = flush_session(args.session)
+        if summary is None:
+            print(f"No buffered events found for session {args.session}.")
+            return 0
+        print(f"Flushed session {args.session}: {summary}")
+        return 0
+
+    results = flush_all(max_age_seconds=args.max_age_seconds)
+    if not results:
+        print("No buffered Copilot sessions found.")
+        return 0
+    for session_id, summary in results.items():
+        print(f"Flushed session {session_id}: {summary}")
+    return 0
+
+
 def main(argv=None) -> int:
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -543,6 +622,8 @@ Examples:
   traccia pricing refresh          Download latest pricing (platform → upstream fallback)
   traccia pricing refresh --source upstream  Fetch directly from upstream, skip platform
   traccia pricing clear            Remove local cache, revert to bundled snapshot
+  traccia copilot install-hooks    Wire GitHub Copilot's hooks to Traccia
+  traccia copilot flush --all      Export any buffered Copilot sessions now
 
 For more information, visit: https://github.com/traccia-ai/traccia
         """
@@ -634,6 +715,61 @@ For more information, visit: https://github.com/traccia-ai/traccia
         help="Delete local pricing cache (revert to bundled snapshot)",
     )
     pricing_clear_cmd.set_defaults(func=_pricing_clear)
+
+    # Copilot command
+    copilot = sub.add_parser(
+        "copilot",
+        help="GitHub Copilot hooks integration",
+        description="Wire GitHub Copilot's hooks to Traccia, and export buffered sessions",
+    )
+    copilot_sub = copilot.add_subparsers(dest="copilot_command", required=True)
+
+    copilot_install = copilot_sub.add_parser(
+        "install-hooks",
+        help="Write a Copilot hooks config that routes events to Traccia",
+        description=(
+            "Generate a GitHub Copilot hooks configuration file that invokes "
+            "`python -m traccia.integrations.github_copilot.hook <event>` for each "
+            "lifecycle event Traccia knows how to map to a span. See "
+            "docs/github-copilot-integration.md for the exact event -> span mapping."
+        ),
+    )
+    copilot_install.add_argument(
+        "--scope",
+        choices=["repo", "user"],
+        default="repo",
+        help=(
+            "repo: write .github/hooks/traccia.json (must be committed to the default "
+            "branch for the cloud coding agent to see it). user: write "
+            "~/.copilot/hooks/traccia.json (Copilot CLI only). Default: repo."
+        ),
+    )
+    copilot_install.add_argument("--force", action="store_true", help="Overwrite existing hook config")
+    copilot_install.add_argument(
+        "--python",
+        help="Python interpreter to invoke in the generated hook command (default: current interpreter)",
+    )
+    copilot_install.set_defaults(func=_copilot_install_hooks)
+
+    copilot_flush = copilot_sub.add_parser(
+        "flush",
+        help="Export buffered Copilot session(s) now",
+        description=(
+            "Materialize and export Traccia spans for GitHub Copilot session(s) buffered "
+            "locally. Normally triggered automatically on sessionEnd; use this to recover "
+            "sessions that ended without a clean sessionEnd event (e.g. a killed process)."
+        ),
+    )
+    copilot_flush_group = copilot_flush.add_mutually_exclusive_group(required=True)
+    copilot_flush_group.add_argument("--session", help="Flush a single session id")
+    copilot_flush_group.add_argument("--all", action="store_true", help="Flush every buffered session")
+    copilot_flush.add_argument(
+        "--max-age-seconds",
+        type=float,
+        default=None,
+        help="With --all, only flush sessions untouched for at least this long",
+    )
+    copilot_flush.set_defaults(func=_copilot_flush)
 
     args = parser.parse_args(argv)
     return args.func(args)

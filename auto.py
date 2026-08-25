@@ -351,6 +351,8 @@ def start_tracing(
     max_block_ms: int = 100,  # Rate limiting block time
     openai_agents: Optional[bool] = None,  # Auto-install OpenAI Agents integration
     crewai: Optional[bool] = None,  # Auto-install CrewAI integration
+    github_copilot: Optional[bool] = None,  # Enable GitHub Copilot hooks integration
+    github_copilot_capture_content: Optional[bool] = None,  # Capture tool/prompt content from Copilot hooks (redacted)
     guardrail_heuristics: Optional[bool] = None,  # Tier C heuristic guardrail detection (default True)
     enable_metrics: bool = True,  # Enable metrics
     metrics_endpoint: Optional[str] = None,  # Metrics endpoint
@@ -754,8 +756,13 @@ def start_tracing(
     if _init_method is None:
         _init_method = "start_tracing"
 
-    # Auto-install framework integrations (OpenAI Agents, CrewAI, etc.)
-    _install_integrations(openai_agents_flag=openai_agents, crewai_flag=crewai)
+    # Auto-install framework integrations (OpenAI Agents, CrewAI, GitHub Copilot, etc.)
+    _install_integrations(
+        openai_agents_flag=openai_agents,
+        crewai_flag=crewai,
+        github_copilot_flag=github_copilot,
+        github_copilot_capture_content_flag=github_copilot_capture_content,
+    )
 
     return provider
 
@@ -1089,6 +1096,8 @@ def _initialize_metrics(
 def _install_integrations(
     openai_agents_flag: Optional[bool],
     crewai_flag: Optional[bool],
+    github_copilot_flag: Optional[bool] = None,
+    github_copilot_capture_content_flag: Optional[bool] = None,
 ) -> None:
     """
     Auto-install framework integrations so that init() and start_tracing()
@@ -1128,4 +1137,22 @@ def _install_integrations(
             install_crewai(enabled=True)
         except Exception:
             # CrewAI not installed or error during install, skip silently
+            pass
+
+    # Determine GitHub Copilot hooks enablement: explicit flag > runtime config > default True
+    copilot_enabled = True
+    if _rc is not None:
+        copilot_enabled = _rc.get_config_value("github_copilot", True)
+    if github_copilot_flag is not None:
+        copilot_enabled = bool(github_copilot_flag)
+
+    if copilot_enabled:
+        try:
+            from traccia.integrations.github_copilot import install as install_github_copilot
+            install_github_copilot(
+                enabled=True,
+                capture_content=github_copilot_capture_content_flag,
+            )
+        except Exception:
+            # Error during install, skip silently
             pass
