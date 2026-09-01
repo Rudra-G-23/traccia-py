@@ -102,8 +102,23 @@ def strip_content_fields(
 
     error = payload.get("error")
     if error is not None:
-        message = error.get("message") if isinstance(error, dict) else str(error)
-        payload["error"] = {"message": (message or "")[:_MAX_ERROR_CHARS]}
+        if isinstance(error, dict):
+            message = error.get("message")
+            err_type = error.get("type") or error.get("name")
+        else:
+            message = str(error)
+            err_type = None
+        # Error text lands in the on-disk session log, so scrub PII here rather
+        # than only at span-build time -- a tool stack trace can carry a path,
+        # token or email. Lazy import keeps the (error-free) hot path lean.
+        from traccia.processors.redaction_processor import redact_string
+
+        cleaned: Dict[str, Any] = {
+            "message": redact_string((message or "")[:_MAX_ERROR_CHARS])
+        }
+        if err_type:
+            cleaned["type"] = str(err_type)[:_MAX_ERROR_CHARS]
+        payload["error"] = cleaned
 
     return payload
 
@@ -222,6 +237,9 @@ def end_attributes(event_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             error_message = error.get("message")
             if error_message:
                 attrs["error.message"] = error_message
+            err_type = error.get("type")
+            if err_type:
+                attrs["error.type"] = err_type
 
     elif event_name == "subagentStop":
         response = payload.get("response")

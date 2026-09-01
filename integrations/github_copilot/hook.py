@@ -32,7 +32,6 @@ def _run(argv: List[str]) -> None:
     if not event_name:
         return
 
-    from traccia.integrations.github_copilot import mapping, state
     from traccia import config as sdk_config
 
     # Fresh process every invocation: nothing from a parent process's
@@ -61,6 +60,11 @@ def _run(argv: List[str]) -> None:
     session_id = payload.get("sessionId")
     if not session_id:
         return  # nothing to correlate this event to
+
+    # Defer these imports until we know there's a real event to record, so the
+    # cheap-reject paths above (disabled, empty/garbage stdin, no sessionId)
+    # don't pay for loading the mapping/redaction modules on every hook fire.
+    from traccia.integrations.github_copilot import mapping, state
 
     if event_name not in mapping.ALL_KNOWN_EVENTS:
         return  # forward-compatible: silently ignore events this version doesn't map yet

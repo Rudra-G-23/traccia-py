@@ -549,6 +549,12 @@ def _copilot_install_hooks(args) -> int:
         return 1
 
     python_bin = args.python or sys.executable
+    # Copilot parses `command` as a shell string, so an interpreter path with a
+    # space (venvs under "C:\Program Files\...", "Application Support", etc.)
+    # must be quoted or it splits into "C:\Program" + "Files\...". Double quotes
+    # work for both POSIX sh and cmd.exe.
+    if " " in python_bin and not (python_bin.startswith('"') and python_bin.endswith('"')):
+        python_bin = f'"{python_bin}"'
     events = sorted(mapping.ALL_KNOWN_EVENTS - mapping.IGNORED_EVENTS)
     hook_config = {
         "version": 1,
@@ -587,7 +593,11 @@ def _copilot_install_hooks(args) -> int:
 
 def _copilot_flush(args) -> int:
     """Export any buffered GitHub Copilot session(s) and clear their local logs."""
-    from traccia.integrations.github_copilot.flush import flush_session, flush_all
+    from traccia.integrations.github_copilot.flush import (
+        flush_session,
+        flush_all,
+        retry_failed,
+    )
 
     if args.session:
         summary = flush_session(args.session)
@@ -597,9 +607,25 @@ def _copilot_flush(args) -> int:
         print(f"Flushed session {args.session}: {summary}")
         return 0
 
-    results = flush_all(max_age_seconds=args.max_age_seconds)
+    if getattr(args, "retry_failed", False):
+        results = retry_failed()
+        if not results:
+            print("No failed Copilot session logs to retry.")
+            return 0
+        for name, summary in results.items():
+            print(f"Retried {name}: {summary}")
+        return 0
+
+    results = flush_all(
+        max_age_seconds=args.max_age_seconds,
+        include_active=getattr(args, "include_active", False),
+    )
     if not results:
-        print("No buffered Copilot sessions found.")
+        print(
+            "No eligible Copilot sessions to flush "
+            "(only sessions with a recorded sessionEnd are flushed by default; "
+            "use --max-age-seconds N to recover orphans, or --include-active)."
+        )
         return 0
     for session_id, summary in results.items():
         print(f"Flushed session {session_id}: {summary}")
@@ -756,18 +782,33 @@ For more information, visit: https://github.com/traccia-ai/traccia
         help="Export buffered Copilot session(s) now",
         description=(
             "Materialize and export Traccia spans for GitHub Copilot session(s) buffered "
-            "locally. Normally triggered automatically on sessionEnd; use this to recover "
-            "sessions that ended without a clean sessionEnd event (e.g. a killed process)."
+            "locally. Normally triggered automatically on sessionEnd. `--all` flushes only "
+            "sessions that have a recorded sessionEnd; add `--max-age-seconds N` to also "
+            "recover orphaned sessions (ended abnormally, idle at least N seconds) or "
+            "`--include-active` to force every buffered session. Sessions whose export "
+            "fails are parked under failed/ and can be replayed with `--retry-failed`."
         ),
     )
     copilot_flush_group = copilot_flush.add_mutually_exclusive_group(required=True)
     copilot_flush_group.add_argument("--session", help="Flush a single session id")
-    copilot_flush_group.add_argument("--all", action="store_true", help="Flush every buffered session")
+    copilot_flush_group.add_argument(
+        "--all", action="store_true", help="Flush every eligible buffered session"
+    )
+    copilot_flush_group.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Re-attempt export for sessions parked under failed/ after a prior export error",
+    )
     copilot_flush.add_argument(
         "--max-age-seconds",
         type=float,
         default=None,
-        help="With --all, only flush sessions untouched for at least this long",
+        help="With --all, also flush sessions with no sessionEnd that have been idle at least this long",
+    )
+    copilot_flush.add_argument(
+        "--include-active",
+        action="store_true",
+        help="With --all, also flush sessions that appear still active (no sessionEnd yet)",
     )
     copilot_flush.set_defaults(func=_copilot_flush)
 

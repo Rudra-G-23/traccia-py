@@ -537,3 +537,280 @@ def test_install_disabled_via_runtime_config():
         assert install_fn(enabled=None) is False
     finally:
         runtime_config.set_config_value("github_copilot", None)
+
+
+# ---------------------------------------------------------------------------
+# Durability / concurrency hardening (follow-up review)
+# ---------------------------------------------------------------------------
+
+
+def test_strip_content_fields_redacts_error_message_and_keeps_type():
+    payload = {
+        "sessionId": "s1",
+        "error": {"message": "email bob@example.com then retry", "type": "ToolError"},
+    }
+    out = mapping.strip_content_fields("postToolUseFailure", payload, capture_content=False)
+    assert "bob@example.com" not in out["error"]["message"]
+    assert "[REDACTED_EMAIL]" in out["error"]["message"]
+    assert out["error"]["type"] == "ToolError"
+
+
+def test_end_attributes_post_tool_use_failure_carries_error_type():
+    result = mapping.end_attributes(
+        "postToolUseFailure", {"error": {"message": "boom", "type": "Timeout"}}
+    )
+    assert result["attributes"]["error.type"] == "Timeout"
+
+
+def test_state_claim_discard_restore_roundtrip(tmp_path):
+    state.append_event("s1", "sessionStart", {"sessionId": "s1"}, state_dir=tmp_path)
+
+    claimed = state.claim_session("s1", state_dir=tmp_path)
+    assert claimed is not None and claimed.name == "s1.jsonl.flushing"
+    # A claimed log is no longer a plain *.jsonl session.
+    assert state.list_sessions(state_dir=tmp_path) == []
+    # A second concurrent flush cannot claim the same session.
+    assert state.claim_session("s1", state_dir=tmp_path) is None
+
+    state.restore_claim(claimed)
+    assert state.list_sessions(state_dir=tmp_path) == ["s1"]
+
+    claimed = state.claim_session("s1", state_dir=tmp_path)
+    state.discard_claim(claimed)
+    assert state.read_events("s1", state_dir=tmp_path) == []
+
+
+def test_state_has_end_event(tmp_path):
+    state.append_event("s1", "sessionStart", {"sessionId": "s1"}, state_dir=tmp_path)
+    assert state.has_end_event("s1", state_dir=tmp_path) is False
+    state.append_event("s1", "sessionEnd", {"sessionId": "s1"}, state_dir=tmp_path)
+    assert state.has_end_event("s1", state_dir=tmp_path) is True
+
+
+def test_flush_session_claim_prevents_double_export(tmp_path):
+    state.append_event("s1", "sessionStart", {"sessionId": "s1"}, state_dir=tmp_path)
+    state.append_event("s1", "sessionEnd", {"sessionId": "s1"}, state_dir=tmp_path)
+
+    held = state.claim_session("s1", state_dir=tmp_path)  # simulate an in-flight flush
+    assert held is not None
+    assert flush_mod.flush_session("s1", state_dir=tmp_path) is None
+
+
+def test_flush_session_archives_on_failed_export_instead_of_deleting(tmp_path):
+    state.append_event("s1", "sessionStart", {"sessionId": "s1"}, state_dir=tmp_path)
+    state.append_event("s1", "sessionEnd", {"sessionId": "s1"}, state_dir=tmp_path)
+
+    with patch("traccia.auto._started", True), patch("traccia.get_tracer"), patch(
+        "traccia.force_flush", return_value=False
+    ) as mock_flush, patch("traccia.stop_tracing"):
+        flush_mod.flush_session("s1", state_dir=tmp_path)
+
+    mock_flush.assert_called_once()
+    # Buffer was NOT dropped -- it moved to failed/ for retry.
+    assert state.read_events("s1", state_dir=tmp_path) == []
+    failed = state.list_failed(state_dir=tmp_path)
+    assert len(failed) == 1
+    assert [e["event"] for e in state.read_events_from_path(failed[0])] == [
+        "sessionStart",
+        "sessionEnd",
+    ]
+
+
+def test_flush_session_clears_on_confirmed_export(tmp_path):
+    state.append_event("s1", "sessionStart", {"sessionId": "s1"}, state_dir=tmp_path)
+    state.append_event("s1", "sessionEnd", {"sessionId": "s1"}, state_dir=tmp_path)
+
+    with patch("traccia.auto._started", True), patch("traccia.get_tracer"), patch(
+        "traccia.force_flush", return_value=True
+    ), patch("traccia.stop_tracing"):
+        flush_mod.flush_session("s1", state_dir=tmp_path)
+
+    assert state.read_events("s1", state_dir=tmp_path) == []
+    assert state.list_failed(state_dir=tmp_path) == []
+
+
+def test_flush_all_skips_live_session_without_session_end(tmp_path):
+    state.append_event("live", "sessionStart", {"sessionId": "live"}, state_dir=tmp_path)
+    with patch("traccia.integrations.github_copilot.flush.flush_session") as mock_one:
+        results = flush_mod.flush_all(state_dir=tmp_path)
+    mock_one.assert_not_called()
+    assert results == {}
+
+
+def test_flush_all_flushes_session_with_recorded_session_end(tmp_path):
+    state.append_event("done", "sessionStart", {"sessionId": "done"}, state_dir=tmp_path)
+    state.append_event("done", "sessionEnd", {"sessionId": "done"}, state_dir=tmp_path)
+    with patch(
+        "traccia.integrations.github_copilot.flush.flush_session", return_value={"tool_spans": 0}
+    ) as mock_one:
+        results = flush_mod.flush_all(state_dir=tmp_path)
+    mock_one.assert_called_once()
+    assert results == {"done": {"tool_spans": 0}}
+
+
+def test_list_stale_claims_only_returns_old_markers(tmp_path):
+    import os as _os
+
+    fresh = tmp_path / "fresh.jsonl.flushing"
+    fresh.write_text("{}\n", encoding="utf-8")
+    stale = tmp_path / "stale.jsonl.flushing"
+    stale.write_text("{}\n", encoding="utf-8")
+    old = time.time() - 7200
+    _os.utime(stale, (old, old))
+
+    found = state.list_stale_claims(3600, state_dir=tmp_path)
+    assert found == [stale]
+
+
+def test_flush_all_reclaims_stale_flushing_marker(tmp_path):
+    marker = tmp_path / "orphan.jsonl.flushing"
+    marker.write_text(
+        json.dumps({"event": "sessionStart", "payload": {"sessionId": "orphan"}, "received_at": 1.0})
+        + "\n",
+        encoding="utf-8",
+    )
+    import os as _os
+
+    old = time.time() - 7200
+    _os.utime(marker, (old, old))
+
+    with patch("traccia.auto._started", True), patch("traccia.get_tracer"), patch(
+        "traccia.force_flush", return_value=True
+    ), patch("traccia.stop_tracing"):
+        results = flush_mod.flush_all(state_dir=tmp_path)
+
+    assert "orphan.jsonl.flushing" in results
+    assert state.list_stale_claims(0, state_dir=tmp_path) == []  # marker consumed
+
+
+def test_flush_all_include_active_flushes_live_session(tmp_path):
+    state.append_event("live", "sessionStart", {"sessionId": "live"}, state_dir=tmp_path)
+    with patch(
+        "traccia.integrations.github_copilot.flush.flush_session", return_value={}
+    ) as mock_one:
+        flush_mod.flush_all(include_active=True, state_dir=tmp_path)
+    mock_one.assert_called_once()
+
+
+def test_retry_failed_reexports_parked_logs(tmp_path):
+    failed_dir = tmp_path / "failed"
+    failed_dir.mkdir()
+    (failed_dir / "s1.123.jsonl").write_text(
+        json.dumps({"event": "sessionStart", "payload": {"sessionId": "s1"}, "received_at": 1.0})
+        + "\n"
+        + json.dumps({"event": "sessionEnd", "payload": {"sessionId": "s1"}, "received_at": 2.0})
+        + "\n",
+        encoding="utf-8",
+    )
+    with patch("traccia.auto._started", True), patch("traccia.get_tracer"), patch(
+        "traccia.force_flush", return_value=True
+    ), patch("traccia.stop_tracing"):
+        results = flush_mod.retry_failed(state_dir=tmp_path)
+    assert list(results) == ["s1.123.jsonl"]
+    assert state.list_failed(state_dir=tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# spans.py -- timing robustness
+# ---------------------------------------------------------------------------
+
+
+def test_build_trace_clamps_negative_duration_from_skewed_timestamps():
+    tracer, exporter = _make_tracer()
+    base = time.time()
+    events = [
+        {"event": "sessionStart", "payload": {"sessionId": "s1", "timestamp": base}, "received_at": base},
+        {
+            "event": "preToolUse",
+            "payload": {"sessionId": "s1", "toolName": "shell", "timestamp": base + 5},
+            "received_at": base + 1,
+        },
+        {
+            # arrives later but its own timestamp is *earlier* than preToolUse's
+            "event": "postToolUse",
+            "payload": {
+                "sessionId": "s1",
+                "toolName": "shell",
+                "timestamp": base + 2,
+                "toolResult": {"textResultForLlm": "ok"},
+            },
+            "received_at": base + 2,
+        },
+    ]
+    spans_mod.build_trace(tracer, events)
+    tool_span = next(
+        s for s in exporter.get_finished_spans() if s.name == "github_copilot.tool.shell"
+    )
+    assert tool_span.end_time >= tool_span.start_time  # never negative
+
+
+def test_build_trace_safety_net_uses_last_event_time_not_wall_clock():
+    tracer, exporter = _make_tracer()
+    old = time.time() - 10_000  # session happened long before this flush runs
+    events = [
+        {"event": "sessionStart", "payload": {"sessionId": "s1", "timestamp": old}, "received_at": old},
+        {
+            "event": "preToolUse",
+            "payload": {"sessionId": "s1", "toolName": "shell", "timestamp": old + 1},
+            "received_at": old + 1,
+        },
+        # no postToolUse, no sessionEnd -> safety net closes both
+    ]
+    spans_mod.build_trace(tracer, events)
+    cutoff_ns = int((old + 300) * 1e9)
+    for s in exporter.get_finished_spans():
+        assert s.end_time <= cutoff_ns  # closed near the last event, not "now"
+
+
+def test_build_trace_adds_vcs_attributes_from_cwd(tmp_path):
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def _git(*a):
+        subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)
+
+    try:
+        _git("init", "-q")
+        _git("config", "user.email", "t@example.com")
+        _git("config", "user.name", "t")
+        _git("commit", "--allow-empty", "-m", "init", "-q")
+        _git("branch", "-M", "feat/x")
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        import pytest
+
+        pytest.skip("git not available")
+
+    tracer, exporter = _make_tracer()
+    events = _events(
+        ("sessionStart", {"sessionId": "s1", "cwd": str(repo)}, 0),
+        ("sessionEnd", {"sessionId": "s1"}, 1),
+    )
+    spans_mod.build_trace(tracer, events)
+    session_span = next(
+        s for s in exporter.get_finished_spans() if s.name == "github_copilot.session"
+    )
+    assert session_span.attributes.get("vcs.branch.name") == "feat/x"
+    assert "vcs.commit.sha" in session_span.attributes
+
+
+# ---------------------------------------------------------------------------
+# cli.py -- install-hooks
+# ---------------------------------------------------------------------------
+
+
+def test_install_hooks_quotes_spaced_interpreter_path(tmp_path, monkeypatch):
+    import types
+
+    from traccia import cli
+
+    monkeypatch.chdir(tmp_path)
+    args = types.SimpleNamespace(
+        scope="repo", force=True, python="/opt/py 3.13/bin/python"
+    )
+    assert cli._copilot_install_hooks(args) == 0
+
+    cfg = json.loads((tmp_path / ".github" / "hooks" / "traccia.json").read_text())
+    command = cfg["hooks"]["sessionStart"][0]["command"]
+    assert command.startswith('"/opt/py 3.13/bin/python" -m traccia.integrations.github_copilot.hook')
