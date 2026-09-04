@@ -310,6 +310,238 @@ def test_sync_stream_create_finalizes_once_and_uses_message_start_response(monke
     assert span.attributes["llm.completion"] == "complete response"
 
 
+def test_raw_stream_accumulates_text_and_message_delta_usage(monkeypatch):
+    initial_message = {
+        "id": "msg_raw_stream",
+        "model": "claude-stream",
+        "content": [],
+        "usage": {"input_tokens": 7, "output_tokens": 0},
+    }
+    events = [
+        {"type": "message_start", "message": initial_message},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hello "},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "world"},
+        },
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 9},
+        },
+        {"type": "message_stop"},
+    ]
+
+    class Messages:
+        def create(self, **kwargs):
+            return iter(events)
+
+    class AsyncMessages:
+        pass
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer, metrics = FakeTracer(), []
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(
+        anthropic_mod,
+        "_record_metrics",
+        lambda *args, **kwargs: metrics.append((args, kwargs)),
+    )
+
+    anthropic_mod.patch_anthropic()
+    list(Messages().create(model="claude-request", stream=True))
+
+    span = tracer.spans[0]
+    assert span.attributes["llm.completion"] == "hello world"
+    assert span.attributes["llm.stop_reason"] == "end_turn"
+    assert span.attributes["llm.usage.input_tokens"] == 7
+    assert span.attributes["llm.usage.output_tokens"] == 9
+    assert metrics[0][0][1]["output_tokens"] == 9
+
+
+def test_helper_text_stream_finalizes_from_accumulated_snapshot(monkeypatch):
+    final_message = {
+        "id": "msg_helper_stream",
+        "model": "claude-helper",
+        "content": [{"type": "text", "text": "hello world"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 4, "output_tokens": 6},
+    }
+
+    class MessageStream:
+        current_message_snapshot = final_message
+
+        def __init__(self):
+            self.text_stream = iter(["hello ", "world"])
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+
+        def close(self):
+            self.closed = True
+
+    class MessageStreamManager:
+        def __init__(self):
+            self.stream = MessageStream()
+            self.exited = False
+
+        def __enter__(self):
+            return self.stream
+
+        def __exit__(self, exc_type, exc, tb):
+            self.exited = True
+            self.stream.close()
+
+    manager = MessageStreamManager()
+
+    class Messages:
+        def stream(self, **kwargs):
+            return manager
+
+    class AsyncMessages:
+        pass
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+    with Messages().stream(model="claude-request") as stream:
+        assert "".join(stream.text_stream) == "hello world"
+
+    span = tracer.spans[0]
+    assert span.attributes["llm.completion"] == "hello world"
+    assert span.attributes["llm.usage.output_tokens"] == 6
+    assert manager.exited is True
+    assert span.exited == 1
+
+
+def test_async_helper_text_stream_finalizes_from_snapshot(monkeypatch):
+    final_message = {
+        "id": "msg_async_text_stream",
+        "model": "claude-async-helper",
+        "content": [{"type": "text", "text": "async hello"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 2, "output_tokens": 3},
+    }
+
+    class AsyncMessageStream:
+        current_message_snapshot = final_message
+
+        def __init__(self):
+            self.text_stream = self._text_stream()
+
+        async def _text_stream(self):
+            yield "async "
+            yield "hello"
+
+        async def close(self):
+            pass
+
+    class AsyncMessageStreamManager:
+        def __init__(self):
+            self.stream = AsyncMessageStream()
+
+        async def __aenter__(self):
+            return self.stream
+
+        async def __aexit__(self, exc_type, exc, tb):
+            await self.stream.close()
+
+    class Messages:
+        pass
+
+    class AsyncMessages:
+        def stream(self, **kwargs):
+            return AsyncMessageStreamManager()
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+
+    async def consume():
+        async with AsyncMessages().stream(model="claude-request") as stream:
+            return "".join([part async for part in stream.text_stream])
+
+    assert asyncio.run(consume()) == "async hello"
+    attrs = tracer.spans[0].attributes
+    assert attrs["llm.completion"] == "async hello"
+    assert attrs["llm.response.id"] == "msg_async_text_stream"
+    assert attrs["llm.usage.output_tokens"] == 3
+
+
+def test_async_helper_get_final_message_finalizes_from_snapshot(monkeypatch):
+    final_message = {
+        "id": "msg_async_helper",
+        "model": "claude-async-helper",
+        "content": [{"type": "text", "text": "async response"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 2, "output_tokens": 3},
+    }
+
+    class AsyncMessageStream:
+        current_message_snapshot = final_message
+
+        async def get_final_message(self):
+            return final_message
+
+        async def close(self):
+            pass
+
+    class AsyncMessageStreamManager:
+        def __init__(self):
+            self.stream = AsyncMessageStream()
+            self.exited = False
+
+        async def __aenter__(self):
+            return self.stream
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.exited = True
+            await self.stream.close()
+
+    manager = AsyncMessageStreamManager()
+
+    class Messages:
+        pass
+
+    class AsyncMessages:
+        def stream(self, **kwargs):
+            return manager
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+
+    async def consume():
+        async with AsyncMessages().stream(model="claude-request") as stream:
+            return await stream.get_final_message()
+
+    response = asyncio.run(consume())
+    assert response["id"] == "msg_async_helper"
+    span = tracer.spans[0]
+    assert span.attributes["llm.completion"] == "async response"
+    assert span.attributes["llm.usage.output_tokens"] == 3
+    assert manager.exited is True
+    assert span.exited == 1
+
+
 def test_direct_stream_method_and_close_finalize_span(monkeypatch):
     class ClosableStream:
         def __init__(self):
@@ -343,6 +575,32 @@ def test_direct_stream_method_and_close_finalize_span(monkeypatch):
     assert stream.closed is True
     assert tracer.spans[0].exited == 1
     assert tracer.spans[0].attributes["llm.prompt"] == "user: hi"
+
+
+def test_direct_stream_method_error_records_error_span(monkeypatch):
+    class Messages:
+        def stream(self, **kwargs):
+            raise RuntimeError("invalid stream request")
+
+    class AsyncMessages:
+        pass
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer, metrics = FakeTracer(), []
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(
+        anthropic_mod,
+        "_record_metrics",
+        lambda *args, **kwargs: metrics.append((args, kwargs)),
+    )
+
+    anthropic_mod.patch_anthropic()
+    with pytest.raises(RuntimeError, match="invalid stream request"):
+        Messages().stream(model="claude-test")
+
+    assert isinstance(tracer.spans[0].exception, RuntimeError)
+    assert tracer.spans[0].exited == 1
+    assert metrics[0][1] == {"error": True}
 
 
 def test_sync_stream_manager_returns_actual_stream_from_context(monkeypatch):
@@ -539,6 +797,213 @@ def test_async_stream_create_is_traced(monkeypatch):
     assert span.exited == 1
     assert span.attributes["llm.model"] == "claude-async-stream"
     assert span.attributes["llm.usage.completion_tokens"] == 2
+
+
+def test_sync_helper_get_final_text_uses_snapshot_for_response_metadata(monkeypatch):
+    final_message = {
+        "id": "msg_sync_final_text",
+        "model": "claude-sync-final-text",
+        "content": [{"type": "text", "text": "final answer"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 8, "output_tokens": 4},
+    }
+
+    class MessageStream:
+        current_message_snapshot = final_message
+
+        def get_final_text(self):
+            return "final answer"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    class MessageStreamManager:
+        def __enter__(self):
+            return MessageStream()
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    class Messages:
+        def stream(self, **kwargs):
+            return MessageStreamManager()
+
+    class AsyncMessages:
+        pass
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+    with Messages().stream(model="claude-request") as stream:
+        assert stream.get_final_text() == "final answer"
+
+    attrs = tracer.spans[0].attributes
+    assert attrs["llm.completion"] == "final answer"
+    assert attrs["llm.response.id"] == "msg_sync_final_text"
+    assert attrs["llm.usage.output_tokens"] == 4
+
+
+def test_sync_helper_until_done_uses_current_snapshot(monkeypatch):
+    final_message = {
+        "id": "msg_sync_until_done",
+        "model": "claude-sync-until-done",
+        "content": [{"type": "text", "text": "consumed"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 2},
+    }
+
+    class MessageStream:
+        current_message_snapshot = None
+
+        def until_done(self):
+            type(self).current_message_snapshot = final_message
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    class MessageStreamManager:
+        def __enter__(self):
+            return MessageStream()
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    class Messages:
+        def stream(self, **kwargs):
+            return MessageStreamManager()
+
+    class AsyncMessages:
+        pass
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+    with Messages().stream(model="claude-request") as stream:
+        stream.until_done()
+
+    attrs = tracer.spans[0].attributes
+    assert attrs["llm.completion"] == "consumed"
+    assert attrs["llm.response.id"] == "msg_sync_until_done"
+    assert attrs["llm.usage.output_tokens"] == 2
+
+
+def test_raw_stream_tool_use_accumulates_tool_metadata(monkeypatch):
+    initial_message = {
+        "id": "msg_tool_stream",
+        "model": "claude-tool-stream",
+        "content": [],
+        "usage": {"input_tokens": 5, "output_tokens": 0},
+    }
+    class Stream:
+        def __iter__(self):
+            yield {"type": "message_start", "message": initial_message}
+            yield {
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "lookup", "id": "tool-1"},
+            }
+            yield {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"output_tokens": 7},
+            }
+            yield {"type": "message_stop"}
+
+    class Messages:
+        def create(self, **kwargs):
+            return Stream()
+
+    class AsyncMessages:
+        pass
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+    list(Messages().create(model="claude-request", stream=True))
+
+    attrs = tracer.spans[0].attributes
+    assert attrs["llm.completion"] == "[tool_use lookup (tool-1)]"
+    assert attrs["llm.response.id"] == "msg_tool_stream"
+    assert attrs["llm.usage.output_tokens"] == 7
+
+
+def test_async_close_waits_for_sdk_close_before_finalizing(monkeypatch):
+    class AsyncStream:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    stream = AsyncStream()
+
+    class Messages:
+        pass
+
+    class AsyncMessages:
+        def stream(self, **kwargs):
+            return stream
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+
+    async def consume():
+        traced_stream = AsyncMessages().stream(model="claude-request")
+        await traced_stream.close()
+        return traced_stream
+
+    traced_stream = asyncio.run(consume())
+    assert stream.closed is True
+    assert tracer.spans[0].exited == 1
+    assert traced_stream._done is True
+
+
+def test_async_close_error_marks_span_as_failed(monkeypatch):
+    class AsyncStream:
+        async def close(self):
+            raise RuntimeError("close failed")
+
+    class Messages:
+        pass
+
+    class AsyncMessages:
+        def stream(self, **kwargs):
+            return AsyncStream()
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+
+    async def consume():
+        traced_stream = AsyncMessages().stream(model="claude-request")
+        with pytest.raises(RuntimeError, match="close failed"):
+            await traced_stream.close()
+
+    asyncio.run(consume())
+    assert isinstance(tracer.spans[0].exception, RuntimeError)
+    assert tracer.spans[0].status[1] == "close failed"
+    assert tracer.spans[0].exited == 1
 
 
 def test_patch_returns_false_when_anthropic_cannot_be_imported(monkeypatch):

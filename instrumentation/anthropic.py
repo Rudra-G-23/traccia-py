@@ -7,6 +7,7 @@ import inspect
 import json
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, Mapping, Optional, Tuple
 
 from traccia.tracer.span import SpanStatus
@@ -158,7 +159,9 @@ def _record_metrics(
         except Exception:
             pass
         if usage:
-            recorder.record_token_usage(usage.get("input_tokens"), usage.get("output_tokens"), attrs)
+            recorder.record_token_usage(
+                usage.get("input_tokens"), usage.get("output_tokens"), attrs
+            )
         recorder.record_duration(duration, attrs)
         if cost is not None:
             recorder.record_cost(cost, attrs)
@@ -193,7 +196,116 @@ def _start_attrs(model: Any, args: Tuple[Any, ...], kwargs: Mapping[str, Any]) -
     return attrs
 
 
-def _finish(span: Any, response: Any, request_model: Any, started: float) -> None:
+_UNSET = object()
+
+
+@dataclass
+class _StreamResult:
+    response: Any
+    completion: Optional[str]
+    usage: Dict[str, Any]
+    stop_reason: Any
+
+
+class _StreamTraceState:
+    """Accumulate Anthropic stream state behind one small internal interface."""
+
+    def __init__(self) -> None:
+        self._initial_response: Any = None
+        self._last_message: Any = None
+        self._completion_parts: list[str] = []
+        self._usage: Dict[str, Any] = {}
+        self._stop_reason: Any = _UNSET
+
+    def observe_event(self, event: Any) -> None:
+        if event is None:
+            return
+
+        event_type = _field(event, "type")
+        message = _field(event, "message")
+        if message is not None:
+            self._last_message = message
+            if event_type == "message_start":
+                self._initial_response = message
+
+        if event_type == "message_delta":
+            delta = _field(event, "delta")
+            stop_reason = _field(delta, "stop_reason")
+            if stop_reason is not None:
+                self._stop_reason = stop_reason
+            self._usage.update(_usage(event))
+        elif event_type == "content_block_start":
+            block = _field(event, "content_block")
+            if _field(block, "type") == "tool_use":
+                name, block_id = _field(block, "name"), _field(block, "id")
+                label = "[tool_use{}{}]".format(
+                    " " + str(name) if name else "",
+                    " (" + str(block_id) + ")" if block_id else "",
+                )
+                self._completion_parts.append(label)
+        elif event_type == "content_block_delta":
+            delta = _field(event, "delta")
+            if _field(delta, "type") == "text_delta":
+                text = _field(delta, "text")
+                if text is not None:
+                    self._completion_parts.append(str(text))
+
+    def observe_text(self, item: Any) -> None:
+        if isinstance(item, str):
+            self._completion_parts.append(item)
+            return
+        text = _field(item, "text")
+        if text is not None and _field(item, "type") in {"text", "text_delta"}:
+            self._completion_parts.append(str(text))
+
+    def resolve(
+        self,
+        response: Any = _UNSET,
+        snapshot: Any = None,
+        completion: Any = _UNSET,
+    ) -> _StreamResult:
+        selected_response = None
+        if response is not _UNSET and response is not None and not isinstance(response, str):
+            selected_response = response
+        elif snapshot is not None:
+            selected_response = snapshot
+        elif self._last_message is not None:
+            selected_response = self._last_message
+        else:
+            selected_response = self._initial_response
+
+        response_content = _field(selected_response, "content")
+        if completion is _UNSET:
+            if response_content:
+                resolved_completion = _content_text(response_content)
+            else:
+                resolved_completion = "".join(self._completion_parts) or None
+        else:
+            resolved_completion = completion
+
+        resolved_usage = _usage(selected_response)
+        resolved_usage.update(self._usage)
+        stop_reason = self._stop_reason
+        if stop_reason is _UNSET:
+            stop_reason = _field(selected_response, "stop_reason", _UNSET)
+
+        return _StreamResult(
+            response=selected_response,
+            completion=resolved_completion,
+            usage=resolved_usage,
+            stop_reason=stop_reason,
+        )
+
+
+def _finish(
+    span: Any,
+    response: Any,
+    request_model: Any,
+    started: float,
+    completion: Optional[str] = None,
+    usage: Optional[Mapping[str, Any]] = None,
+    stop_reason: Any = _UNSET,
+) -> None:
     response_model = _field(response, "model") or request_model
     if response_model:
         span.set_attribute("llm.model", response_model)
@@ -202,32 +314,43 @@ def _finish(span: Any, response: Any, request_model: Any, started: float) -> Non
     if response_id:
         span.set_attribute("llm.response.id", response_id)
         span.set_attribute("gen_ai.response.id", response_id)
-    stop = _field(response, "stop_reason")
+    stop = _field(response, "stop_reason") if stop_reason is _UNSET else stop_reason
     if stop is not None:
         span.set_attribute("llm.stop_reason", stop)
         span.set_attribute("gen_ai.response.finish_reasons", [str(stop)])
-    content = _content_text(_field(response, "content"))
+    content = completion if completion else _content_text(_field(response, "content"))
     if content:
         span.set_attribute("llm.completion", content[:_limit()])
         span.set_attribute("gen_ai.response.content", content[:_limit()])
-    usage = _usage(response)
-    for key, value in usage.items():
+    response_usage = dict(_usage(response))
+    if usage:
+        response_usage.update(usage)
+    for key, value in response_usage.items():
         span.set_attribute("llm.usage." + key, value)
         span.set_attribute("gen_ai.usage." + key, value)
-    if usage.get("input_tokens") is not None:
-        span.set_attribute("llm.usage.prompt_tokens", usage["input_tokens"])
+    if response_usage.get("input_tokens") is not None:
+        span.set_attribute("llm.usage.prompt_tokens", response_usage["input_tokens"])
         span.set_attribute("llm.usage.prompt_source", "provider_usage")
-    if usage.get("output_tokens") is not None:
-        span.set_attribute("llm.usage.completion_tokens", usage["output_tokens"])
+    if response_usage.get("output_tokens") is not None:
+        span.set_attribute("llm.usage.completion_tokens", response_usage["output_tokens"])
         span.set_attribute("llm.usage.completion_source", "provider_usage")
-    if usage:
+    if response_usage:
         span.set_attribute("llm.usage.source", "provider_usage")
-    _record_metrics(response_model, usage, time.perf_counter() - started,
-                    _compute_cost(response_model, usage.get("input_tokens"), usage.get("output_tokens")))
+    _record_metrics(
+        response_model,
+        response_usage,
+        time.perf_counter() - started,
+        _compute_cost(
+            response_model,
+            response_usage.get("input_tokens"),
+            response_usage.get("output_tokens"),
+        ),
+    )
 
 
 class _StreamProxy:
-    """Proxy preserving the SDK stream while finalizing its span exactly once."""
+    """Forward SDK stream protocols while reporting through shared stream state."""
+
     def __init__(
         self,
         stream: Any,
@@ -237,34 +360,120 @@ class _StreamProxy:
         span_exit: Optional[Callable[..., Any]] = None,
     ) -> None:
         self._stream, self._span, self._started = stream, span, started
-        self._request_model, self._response, self._done = request_model, None, False
+        self._request_model, self._done = request_model, False
         self._span_exit = span_exit
         self._entered_stream: Any = None
+        self._final_snapshot: Any = None
+        self._trace_state = _StreamTraceState()
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
+        value = getattr(self._stream, name)
+        if name == "text_stream":
+            return self._wrap_text_stream(value)
+        if name in {"get_final_message", "get_final_text", "until_done"}:
+            return self._wrap_terminal_method(name, value)
+        return value
+
+    def _snapshot(self) -> Any:
+        if self._final_snapshot is not None:
+            return self._final_snapshot
+        try:
+            return getattr(self._stream, "current_message_snapshot", None)
+        except Exception:
+            return None
+
+    def _wrap_terminal_method(self, name: str, method: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(method)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            try:
+                result = method(*args, **kwargs)
+            except BaseException as exc:
+                self._finish(exc)
+                raise
+            if inspect.isawaitable(result):
+                async def await_result() -> Any:
+                    try:
+                        resolved = await result
+                    except BaseException as exc:
+                        self._finish(exc)
+                        raise
+                    self._finish_result(name, resolved)
+                    return resolved
+
+                return await_result()
+            self._finish_result(name, result)
+            return result
+
+        return wrapped
+
+    def _finish_result(self, name: str, result: Any) -> None:
+        if name == "get_final_message":
+            self._final_snapshot = result
+            self._finish(response=result)
+        elif name == "get_final_text":
+            self._finish(response=self._snapshot(), completion=result)
+        else:
+            self._finish(response=self._snapshot())
+
+    def _wrap_text_stream(self, stream: Any) -> Any:
+        if hasattr(stream, "__aiter__") and not hasattr(stream, "__next__"):
+            async def async_text_stream() -> AsyncIterator[Any]:
+                try:
+                    async for item in stream:
+                        self._trace_state.observe_text(item)
+                        yield item
+                except BaseException as exc:
+                    self._finish(exc)
+                    raise
+                else:
+                    self._final_snapshot = self._snapshot()
+                    self._finish(response=self._final_snapshot)
+
+            return async_text_stream()
+
+        def text_stream() -> Iterator[Any]:
+            try:
+                for item in stream:
+                    self._trace_state.observe_text(item)
+                    yield item
+            except BaseException as exc:
+                self._finish(exc)
+                raise
+            else:
+                self._final_snapshot = self._snapshot()
+                self._finish(response=self._final_snapshot)
+
+        return text_stream()
 
     def _event(self, event: Any) -> None:
-        if event is not None:
-            message = _field(event, "message")
-            if message is not None:
-                self._response = message
-            elif self._response is None:
-                self._response = event
+        self._trace_state.observe_event(event)
         if _field(event, "type") == "message_stop":
-            self._finish()
+            self._finish(response=self._snapshot())
 
-    def _finish(self, exc: Optional[BaseException] = None) -> None:
+    def _finish(
+        self,
+        exc: Optional[BaseException] = None,
+        response: Any = _UNSET,
+        completion: Any = _UNSET,
+    ) -> None:
         if self._done:
             return
         self._done = True
+        result = self._trace_state.resolve(
+            response=response,
+            snapshot=self._snapshot(),
+            completion=completion,
+        )
         _close_stream_span(
             self._span,
             self._started,
             self._request_model,
             self._span_exit,
             exc,
-            self._response,
+            result.response,
+            completion=result.completion,
+            usage=result.usage,
+            stop_reason=result.stop_reason,
         )
 
     def __iter__(self) -> Iterator[Any]:
@@ -292,12 +501,25 @@ class _StreamProxy:
 
     def close(self) -> Any:
         try:
-            return self._stream.close()
+            result = self._stream.close()
         except BaseException as exc:
             self._finish(exc)
             raise
-        finally:
-            self._finish()
+
+        if inspect.isawaitable(result):
+            async def await_close() -> Any:
+                try:
+                    resolved = await result
+                except BaseException as exc:
+                    self._finish(exc)
+                    raise
+                self._finish()
+                return resolved
+
+            return await_close()
+
+        self._finish()
+        return result
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         try:
@@ -321,15 +543,6 @@ class _StreamProxy:
         except BaseException as exc:
             self._finish(exc)
             raise
-
-    async def aclose(self) -> Any:
-        try:
-            return await self._stream.aclose()
-        except BaseException as exc:
-            self._finish(exc)
-            raise
-        finally:
-            self._finish()
 
     def __enter__(self) -> "_StreamProxy":
         try:
@@ -411,6 +624,9 @@ def _close_stream_span(
     span_exit: Optional[Callable[..., Any]],
     exc: Optional[BaseException],
     response: Any,
+    completion: Optional[str] = None,
+    usage: Optional[Mapping[str, Any]] = None,
+    stop_reason: Any = _UNSET,
 ) -> None:
     try:
         if exc is not None:
@@ -418,7 +634,15 @@ def _close_stream_span(
             span.set_status(SpanStatus.ERROR, str(exc))
             _record_metrics(model, {}, time.perf_counter() - started, error=True)
         else:
-            _finish(span, response, model, started)
+            _finish(
+                span,
+                response,
+                model,
+                started,
+                completion=completion,
+                usage=usage,
+                stop_reason=stop_reason,
+            )
     except Exception as instrumentation_error:
         try:
             span.record_exception(instrumentation_error)
@@ -470,7 +694,9 @@ def _trace_call(
             raise
 
 
-def _call(fn: Callable[..., Any], self: Any, args: Tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
+def _call(
+    fn: Callable[..., Any], self: Any, args: Tuple[Any, ...], kwargs: Mapping[str, Any]
+) -> Any:
     model = _request_model(args, kwargs)
     with _trace_call(model, args, kwargs) as (span, started):
         response = fn(self, *args, **kwargs)
@@ -540,13 +766,25 @@ def _wrap_stream(fn: Callable[..., Any]) -> Callable[..., Any]:
         return fn
     @functools.wraps(fn)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
-        result = fn(self, *args, **kwargs)
         model = _request_model(args, kwargs)
+        span_state = _open_stream_span(model, args, kwargs)
+        try:
+            result = fn(self, *args, **kwargs)
+        except BaseException as exc:
+            span, started, span_exit = span_state
+            _close_stream_span(span, started, model, span_exit, exc, None)
+            raise
         if inspect.isawaitable(result):
             async def await_stream() -> _StreamProxy:
-                return _make_stream(await result, model, args, kwargs)
+                try:
+                    stream = await result
+                except BaseException as exc:
+                    span, started, span_exit = span_state
+                    _close_stream_span(span, started, model, span_exit, exc, None)
+                    raise
+                return _make_stream(stream, model, args, kwargs, span_state)
             return await_stream()
-        return _make_stream(result, model, args, kwargs)
+        return _make_stream(result, model, args, kwargs, span_state)
     wrapped._agent_trace_patched = True
     return wrapped
 
@@ -562,6 +800,7 @@ def _patch_resource_class(resource_cls: Any, is_async: bool) -> bool:
 
 
 def patch_anthropic() -> bool:
+    """Patch Anthropic message resources for sync, async, and streaming calls."""
     global _patched
     if _patched:
         return True
@@ -570,7 +809,10 @@ def patch_anthropic() -> bool:
     except Exception:
         return False
     patched = False
-    for module_name in ("anthropic.resources.messages.messages", "anthropic.resources.beta.messages.messages"):
+    for module_name in (
+        "anthropic.resources.messages.messages",
+        "anthropic.resources.beta.messages.messages",
+    ):
         try:
             module = importlib.import_module(module_name)
             for class_name, is_async in (("Messages", False), ("AsyncMessages", True)):
