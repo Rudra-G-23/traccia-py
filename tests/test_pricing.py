@@ -58,6 +58,11 @@ class TestCostEngine:
         cost = compute_cost("definitely-not-a-model", 100, 100, pricing_table={})
         assert cost is None
 
+    def test_latest_anthropic_opus5_pricing_is_bundled(self):
+        from traccia.processors.cost_engine import compute_cost
+        cost = compute_cost("claude-opus-5", 1000, 1000)
+        assert cost == pytest.approx(0.03, rel=1e-5)
+
     def test_prefix_longer_key_wins(self):
         """gpt-4o should not be matched by gpt-4 key when gpt-4o exists."""
         from traccia.processors.cost_engine import _lookup_price

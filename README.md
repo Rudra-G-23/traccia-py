@@ -36,6 +36,12 @@ Built on OpenTelemetry standards, Traccia provides automatic instrumentation, to
 pip install traccia
 ```
 
+For Anthropic SDK instrumentation, install the optional provider dependency:
+
+```bash
+pip install "traccia[anthropic]"
+```
+
 ### Basic Usage
 
 ```python

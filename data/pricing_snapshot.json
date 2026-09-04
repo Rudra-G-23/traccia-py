@@ -489,6 +489,15 @@
       "_max_tokens": 128000,
       "_max_input_tokens": 1000000
     },
+    "anthropic.claude-opus-5": {
+      "prompt": 0.005,
+      "completion": 0.025,
+      "cache_write": 0.00625,
+      "cached_prompt": 0.0005,
+      "_provider": "bedrock_converse",
+      "_mode": "chat",
+      "_max_input_tokens": 1000000
+    },
     "anthropic.claude-mythos-preview": {
       "prompt": 0.0,
       "completion": 0.0,
@@ -4084,6 +4093,15 @@
       "_provider": "anthropic",
       "_mode": "chat",
       "_max_tokens": 128000,
+      "_max_input_tokens": 1000000
+    },
+    "claude-opus-5": {
+      "prompt": 0.005,
+      "completion": 0.025,
+      "cache_write": 0.00625,
+      "cached_prompt": 0.0005,
+      "_provider": "anthropic",
+      "_mode": "chat",
       "_max_input_tokens": 1000000
     },
     "claude-sonnet-4-20250514": {

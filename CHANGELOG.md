@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Added
+- Expanded Anthropic SDK OpenTelemetry instrumentation for structured parsing,
+  tool runners, message batches, Managed Agents, deployment operations, and
+  cache/server-tool usage counters.
 - Redaction allowlist for `traccia.policy.*` span attributes (same pattern as `traccia.prompt.*`)
 - HTTP client skip for `@govern()` status/block calls and prompt-runtime fetches, matching the Node SDK
 
