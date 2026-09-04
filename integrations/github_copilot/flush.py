@@ -70,12 +70,15 @@ def _export_events(events: List[Dict[str, Any]]) -> tuple[Optional[Dict[str, Any
     tracer = traccia.get_tracer("github_copilot")
     summary = spans_mod.build_trace(tracer, events)
 
-    flush_ok = bool(traccia.force_flush(_FLUSH_TIMEOUT_SECONDS))
+    force_flush_result = traccia.force_flush(_FLUSH_TIMEOUT_SECONDS)
+    # Older/custom providers may return None; preserve compatibility for
+    # those providers, while treating an explicit False as a failed export.
+    flush_ok = True if force_flush_result is None else bool(force_flush_result)
     if started_here:
-        # stop_tracing() does a final blocking flush + shutdown, so a span that
-        # missed the force_flush window above still gets exported here.
+        # Shutdown is still useful for releasing resources, but it does not
+        # provide a reliable export acknowledgement. Never turn an explicit
+        # failed force_flush into success, or the durable journal is deleted.
         traccia.stop_tracing()
-        flush_ok = True
 
     return summary, flush_ok
 
@@ -93,6 +96,7 @@ def flush_session(
         return None  # nothing to flush, or a concurrent flush owns it
 
     events = state.read_events_from_path(claimed)
+    initial_fingerprint = state.claim_fingerprint(claimed)
     if not events:
         state.discard_claim(claimed)
         return None
@@ -105,7 +109,9 @@ def flush_session(
         state.restore_claim(claimed)
         raise
 
-    if flush_ok:
+    # A hook can finish writing while export is in flight. Keep the journal if
+    # it changed so the late event is never silently discarded.
+    if flush_ok and state.claim_unchanged(claimed, initial_fingerprint):
         state.discard_claim(claimed)
     else:
         archived = state.archive_failed_claim(claimed)
@@ -189,7 +195,7 @@ def retry_failed(*, state_dir: Optional[Path] = None) -> Dict[str, Optional[Dict
     return results
 
 
-def main(argv: Optional[list] = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="traccia-copilot-flush")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--session", help="Flush a single session id")

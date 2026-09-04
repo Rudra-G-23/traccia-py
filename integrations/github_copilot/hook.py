@@ -23,6 +23,7 @@ Copilot's own permission/behavior).
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import List, Optional
 
@@ -73,7 +74,24 @@ def _run(argv: List[str]) -> None:
     state.append_event(session_id, event_name, payload)
 
     if event_name in mapping.SESSION_END_EVENTS:
-        _spawn_flush(session_id)
+        # A cloud-agent sandbox may be torn down as soon as the hook returns,
+        # so a detached child is not durable there. Repository-installed hooks
+        # opt into a bounded synchronous flush; CLI user hooks stay detached.
+        if os.environ.get("TRACCIA_GITHUB_COPILOT_SYNC_FLUSH") == "1":
+            _flush_sync(session_id)
+        else:
+            _spawn_flush(session_id)
+
+
+def _flush_sync(session_id: str) -> None:
+    """Export a completed session before this hook process exits."""
+    try:
+        from traccia.integrations.github_copilot.flush import flush_session
+
+        flush_session(session_id)
+    except BaseException:
+        # The journal remains recoverable by the normal flush/retry command.
+        pass
 
 
 def _spawn_flush(session_id: str) -> None:

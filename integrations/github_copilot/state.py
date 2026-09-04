@@ -13,8 +13,9 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:  # POSIX advisory locking; absent on Windows
     import fcntl  # type: ignore
@@ -28,6 +29,7 @@ _CLAIM_SUFFIX = ".flushing"
 
 
 def default_state_dir() -> Path:
+    """Return the configured or per-user default Copilot journal directory."""
     # hook.py/flush.py run in a fresh subprocess that never calls
     # traccia.init()/start_tracing(), so runtime_config's in-process globals
     # are never populated here -- read straight from traccia.toml/env instead,
@@ -51,8 +53,35 @@ def _safe_session_filename(session_id: str) -> str:
 
 
 def session_log_path(session_id: str, state_dir: Optional[Path] = None) -> Path:
+    """Return the sanitized JSONL journal path for a Copilot session."""
     base = state_dir or default_state_dir()
     return Path(base) / _safe_session_filename(session_id)
+
+
+def _session_lock_path(session_id: str, state_dir: Optional[Path]) -> Path:
+    return session_log_path(session_id, state_dir).with_suffix(".lock")
+
+
+@contextmanager
+def _session_lock(session_id: str, state_dir: Optional[Path]) -> Iterator[None]:
+    """Serialize journal append and claim/rename operations for one session."""
+    lock_path = _session_lock_path(session_id, state_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                pass
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 def append_event(
@@ -62,8 +91,6 @@ def append_event(
     state_dir: Optional[Path] = None,
 ) -> None:
     """Append one event record to this session's log (creates the file/dir if needed)."""
-    path = session_log_path(session_id, state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     record = {"event": event_name, "payload": payload, "received_at": time.time()}
     line = (json.dumps(record, default=str) + "\n").encode("utf-8")
     # O_APPEND makes each write seek-to-end first. A single short write() is
@@ -72,21 +99,17 @@ def append_event(
     # capture_content=True inlines size-capped tool/prompt text. Take an
     # exclusive advisory lock for the write so concurrent hook processes for the
     # same session can never interleave a partial line, regardless of size.
-    fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    try:
-        if fcntl is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except OSError:
-                pass  # e.g. some network filesystems; fall back to bare append
-        os.write(fd, line)
-    finally:
-        if fcntl is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(fd)
+    with _session_lock(session_id, state_dir):
+        normal = session_log_path(session_id, state_dir)
+        claimed = normal.with_name(normal.name + _CLAIM_SUFFIX)
+        # If a flush already owns the journal, append to that same claimed
+        # file so a late hook event cannot create a silently orphaned sibling.
+        path = claimed if claimed.exists() else normal
+        fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
 
 
 def read_events_from_path(path: Path) -> List[Dict[str, Any]]:
@@ -107,6 +130,7 @@ def read_events_from_path(path: Path) -> List[Dict[str, Any]]:
 
 
 def read_events(session_id: str, state_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Read and parse all valid records for a session."""
     return read_events_from_path(session_log_path(session_id, state_dir))
 
 
@@ -146,34 +170,37 @@ def claim_session(session_id: str, state_dir: Optional[Path] = None) -> Optional
     signal); ``flush_all`` sweeps stale ``.flushing`` files instead -- see
     ``list_stale_claims``.
     """
-    src = session_log_path(session_id, state_dir)
-    claimed = src.with_name(src.name + _CLAIM_SUFFIX)
+    with _session_lock(session_id, state_dir):
+        src = session_log_path(session_id, state_dir)
+        claimed = src.with_name(src.name + _CLAIM_SUFFIX)
 
-    if not src.exists() and not claimed.exists():
-        return None
-
-    try:
-        fd = os.open(str(claimed), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-    except FileExistsError:
-        return None  # another flush holds it
-    except OSError:
-        return None
-
-    # We own the (currently empty) marker. Fold in any buffered data.
-    if src.exists():
+        if claimed.exists() or not src.exists():
+            return None
         try:
             os.replace(src, claimed)  # atomic on the same filesystem
         except OSError:
-            pass
-
-    try:
-        if claimed.stat().st_size == 0:
-            discard_claim(claimed)
             return None
+        try:
+            if claimed.stat().st_size == 0:
+                discard_claim(claimed)
+                return None
+        except OSError:
+            return None
+        return claimed
+
+
+def claim_fingerprint(claimed_path: Path) -> Optional[Tuple[int, int]]:
+    """Return size and mtime for detecting late appends to a claimed journal."""
+    try:
+        stat = Path(claimed_path).stat()
+        return stat.st_size, stat.st_mtime_ns
     except OSError:
         return None
-    return claimed
+
+
+def claim_unchanged(claimed_path: Path, fingerprint: Optional[Tuple[int, int]]) -> bool:
+    """Whether no hook appended to a claimed journal since it was read."""
+    return fingerprint is not None and claim_fingerprint(claimed_path) == fingerprint
 
 
 def list_stale_claims(
@@ -252,6 +279,7 @@ def list_sessions(state_dir: Optional[Path] = None) -> List[str]:
 
 
 def session_age_seconds(session_id: str, state_dir: Optional[Path] = None) -> Optional[float]:
+    """Return the age in seconds of a normal session journal."""
     path = session_log_path(session_id, state_dir)
     try:
         return time.time() - path.stat().st_mtime

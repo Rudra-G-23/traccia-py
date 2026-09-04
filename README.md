@@ -235,7 +235,7 @@ init(crewai=False)  # Explicit parameter
 ### GitHub Copilot
 
 GitHub Copilot (CLI and the cloud coding agent) runs as its own external process, not
-Python code you import — so unlike the integrations above, Traccia doesn't patch anything.
+Python code you import - so unlike the integrations above, Traccia doesn't patch anything.
 Instead, it uses [Copilot's hooks](https://docs.github.com/en/copilot/reference/hooks-reference):
 a small script Traccia registers gets invoked at lifecycle events (session start/end, each
 tool call, subagent runs) and turns them into Traccia spans.
@@ -246,19 +246,21 @@ traccia copilot install-hooks           # writes .github/hooks/traccia.json
 # or: traccia copilot install-hooks --scope user   (Copilot CLI only, not repo-specific)
 ```
 
-That's it — no code changes to your app. Run a Copilot CLI session (or let the cloud coding
-agent work a PR) and traces appear under the `github_copilot.session` span, exported through
-whatever exporter your `traccia.toml`/env vars already configure. Sessions are exported once
-they end (`sessionEnd`); recover any that didn't end cleanly with `traccia copilot flush --all`.
+That's it - no code changes to your app. Run a Copilot CLI session and traces appear under
+the `github_copilot.session` span, exported through whatever exporter your `traccia.toml`/env
+vars already configure. Repository hooks also support cloud-agent jobs when the cloud runtime
+has Traccia installed and the exporter endpoint is allowlisted; see
+`docs/github-copilot-integration.md` for those prerequisites. Sessions are exported once they
+end (`sessionEnd`); recover any that didn't end cleanly with `traccia copilot flush --all`.
 
 **What gets captured**: session id, tool calls (`github_copilot.tool.<name>`, with real
-start/end timestamps reconstructed from the hook events), subagent runs, and errors — by
+start/end timestamps reconstructed from the hook events), subagent runs, and errors - by
 default as **metadata only** (tool names, byte lengths, status), matching Copilot's own
 default-off content capture. Set `github_copilot_capture_content = true` (or
 `TRACCIA_GITHUB_COPILOT_CAPTURE_CONTENT=1`) to additionally capture (still redacted) tool
 arguments/results and prompt text.
 
-**Limitation**: hooks don't expose token counts, model name, or per-model-call latency —
+**Limitation**: hooks don't expose token counts, model name, or per-model-call latency -
 only Copilot's own native OpenTelemetry export has that, and this SDK has no ingestion
 endpoint to receive it (see `docs/github-copilot-integration.md` for the full design and
 why). If you need that level of detail, point Copilot's own `OTEL_EXPORTER_OTLP_ENDPOINT`

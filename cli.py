@@ -528,7 +528,7 @@ def _pricing_clear(args) -> int:
     return 0
 
 
-def _copilot_install_hooks(args) -> int:
+def _copilot_install_hooks(args: argparse.Namespace) -> int:
     """Write a GitHub Copilot hooks config that routes lifecycle events to Traccia.
 
     See docs.github.com/en/copilot/reference/hooks-reference for the config
@@ -544,11 +544,15 @@ def _copilot_install_hooks(args) -> int:
     target_path = target_dir / "traccia.json"
 
     if target_path.exists() and not args.force:
-        print(f"❌ Hook config already exists at {target_path}", file=sys.stderr)
+        print(f"Hook config already exists at {target_path}", file=sys.stderr)
         print("   Use --force to overwrite", file=sys.stderr)
         return 1
 
-    python_bin = args.python or sys.executable
+    # Repository configs are committed and may execute on another machine
+    # (notably Copilot cloud agent). Do not bake the installer host's absolute
+    # interpreter path into that config. User-level configs can safely retain
+    # the current interpreter, which is normally the installed Traccia env.
+    python_bin = args.python or (sys.executable if args.scope == "user" else "python")
     # Copilot parses `command` as a shell string, so an interpreter path with a
     # space (venvs under "C:\Program Files\...", "Application Support", etc.)
     # must be quoted or it splits into "C:\Program" + "Files\...". Double quotes
@@ -565,6 +569,11 @@ def _copilot_install_hooks(args) -> int:
                     "type": "command",
                     "command": f"{python_bin} -m traccia.integrations.github_copilot.hook {event}",
                     "timeoutSec": 30,
+                    **(
+                        {"env": {"TRACCIA_GITHUB_COPILOT_SYNC_FLUSH": "1"}}
+                        if args.scope == "repo"
+                        else {}
+                    ),
                 }
             ]
             for event in events
@@ -577,21 +586,21 @@ def _copilot_install_hooks(args) -> int:
             json.dump(hook_config, f, indent=2)
             f.write("\n")
     except OSError as exc:
-        print(f"❌ Failed to write hook config: {exc}", file=sys.stderr)
+        print(f"Failed to write hook config: {exc}", file=sys.stderr)
         return 1
 
-    print(f"✅ Wrote Copilot hook config to {target_path}")
+    print(f"Wrote Copilot hook config to {target_path}")
     print(f"   Registered events: {', '.join(events)}")
     if args.scope == "repo":
         print("   This must be committed and on the repository's default branch")
         print("   for the GitHub-hosted coding agent to pick it up.")
-    print("\n📝 Next: run `traccia doctor` and start a Copilot CLI session to verify.")
+    print("\nNext: run `traccia doctor` and start a Copilot CLI session to verify.")
     print("   Sessions are exported once they end; use `traccia copilot flush --all`")
     print("   to recover any session that ended without a clean sessionEnd event.")
     return 0
 
 
-def _copilot_flush(args) -> int:
+def _copilot_flush(args: argparse.Namespace) -> int:
     """Export any buffered GitHub Copilot session(s) and clear their local logs."""
     from traccia.integrations.github_copilot.flush import (
         flush_session,

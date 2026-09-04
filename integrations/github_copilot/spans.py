@@ -118,8 +118,11 @@ def _discard(stack: List[Any], span: Any) -> None:
 def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Replay one session's buffered events onto `tracer`.
 
-    Returns a small summary dict (span/error counts) for callers/tests, or
-    None if there was nothing to build.
+    Args:
+        tracer: Traccia tracer used to materialize the replayed spans.
+        events: Buffered hook records in JSONL record shape.
+    Returns:
+        A summary dict with span/error counts, or None for no events.
     """
     if not events:
         return None
@@ -128,10 +131,27 @@ def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str,
 
     session_span: Optional[Any] = None
     tool_queues: Dict[str, Deque[Any]] = defaultdict(deque)
-    subagent_spans: Dict[str, Any] = {}
+    # subagentStart does not provide agentId, while subagentStop does. Match
+    # on agentName and queue starts so normal completions (and same-name
+    # concurrent agents) are paired correctly.
+    subagent_spans: Dict[str, Deque[Any]] = defaultdict(deque)
     open_spans: List[Any] = []  # innermost-open-last, for errorOccurred attribution
     summary = {"tool_spans": 0, "subagent_spans": 0, "errors": 0}
     last_event_ns: Optional[int] = None
+
+    def pop_subagent(payload: Dict[str, Any]) -> Optional[Any]:
+        """Pair a stop event by name, with a safe legacy single-span fallback."""
+        key = payload.get("agentName") or payload.get("agentType")
+        queue = subagent_spans.get(key) if key else None
+        if queue:
+            return queue.popleft()
+        # Older fixtures/clients may only send agentId at stop time. There is
+        # no way to map that id to a start, so only use it when unambiguous.
+        if payload.get("agentId"):
+            candidates = [q for q in subagent_spans.values() if q]
+            if len(candidates) == 1:
+                return candidates[0].popleft()
+        return None
 
     def ensure_session_span(payload: Dict[str, Any], start_ns: int) -> Any:
         nonlocal session_span
@@ -216,14 +236,13 @@ def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str,
                 start_time=start_ns,
             )
             _set_attrs(span, mapping.start_attributes(event_name, payload))
-            key = payload.get("agentId") or payload.get("agentName") or "unknown"
-            subagent_spans[key] = span
+            key = payload.get("agentName") or payload.get("agentType") or "unknown"
+            subagent_spans[key].append(span)
             open_spans.append(span)
             summary["subagent_spans"] += 1
 
         elif event_name in mapping.SUBAGENT_END_EVENTS:
-            key = payload.get("agentId") or payload.get("agentName") or "unknown"
-            span = subagent_spans.pop(key, None)
+            span = pop_subagent(payload)
             if span is None:
                 continue  # no matching subagentStart captured in this session's log
             _discard(open_spans, span)

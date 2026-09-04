@@ -52,6 +52,28 @@ _CONTENT_FIELDS_BY_EVENT: Dict[str, tuple] = {
     "subagentStop": ("response",),
     "userPromptSubmitted": ("prompt",),
     "userPromptTransformed": ("prompt", "transformedPrompt"),
+    "subagentStart": ("agentDescription",),
+    "preCompact": ("customInstructions",),
+}
+
+# Keep the on-disk journal intentionally narrow. Copilot may add fields to a
+# payload over time; unknown fields must not become an accidental content
+# capture channel.
+_SAFE_FIELDS_BY_EVENT: Dict[str, frozenset] = {
+    "sessionStart": frozenset({"sessionId", "timestamp", "cwd", "source", "initialPrompt"}),
+    "sessionEnd": frozenset({"sessionId", "timestamp", "cwd", "reason"}),
+    "preToolUse": frozenset({"sessionId", "timestamp", "cwd", "toolName", "toolArgs"}),
+    "postToolUse": frozenset({"sessionId", "timestamp", "cwd", "toolName", "toolArgs", "toolResult"}),
+    "postToolUseFailure": frozenset({"sessionId", "timestamp", "cwd", "toolName", "toolArgs", "error"}),
+    "subagentStart": frozenset({"sessionId", "timestamp", "cwd", "transcriptPath", "agentName", "agentDisplayName", "agentDescription"}),
+    "subagentStop": frozenset({"sessionId", "timestamp", "cwd", "transcriptPath", "agentId", "agentType", "agentName", "agentDisplayName", "response", "stopReason"}),
+    "errorOccurred": frozenset({"sessionId", "timestamp", "cwd", "error", "errorContext", "recoverable"}),
+    "preCompact": frozenset({"sessionId", "timestamp", "cwd", "transcriptPath", "trigger", "customInstructions"}),
+    "userPromptSubmitted": frozenset({"sessionId", "timestamp", "cwd", "prompt"}),
+    "userPromptTransformed": frozenset({"sessionId", "timestamp", "cwd", "prompt", "transformedPrompt"}),
+    "agentStop": frozenset({"sessionId", "timestamp", "cwd", "transcriptPath", "stopReason", "stop_hook_active"}),
+    "notification": frozenset({"sessionId", "timestamp", "cwd", "title", "notification_type"}),
+    "permissionRequest": frozenset({"sessionId", "timestamp", "cwd", "toolName"}),
 }
 
 _MAX_ERROR_CHARS = 200
@@ -90,7 +112,11 @@ def strip_content_fields(
     either ``{"_stripped": True, "length": N}`` or an already size-capped
     plain string -- callers never need to re-truncate.
     """
-    payload = dict(payload or {})
+    payload = {
+        key: value
+        for key, value in dict(payload or {}).items()
+        if key in _SAFE_FIELDS_BY_EVENT.get(event_name, frozenset({"sessionId", "timestamp", "cwd"}))
+    }
     for field in _CONTENT_FIELDS_BY_EVENT.get(event_name, ()):
         if field not in payload or payload[field] is None:
             continue
@@ -124,6 +150,7 @@ def strip_content_fields(
 
 
 def span_name_for(event_name: str, payload: Dict[str, Any]) -> str:
+    """Return the stable Traccia span name for one Copilot event."""
     if event_name in SESSION_START_EVENTS:
         return "github_copilot.session"
     if event_name in TOOL_START_EVENTS or event_name in TOOL_END_EVENTS:
@@ -152,7 +179,14 @@ def _content_length(value: Any) -> Optional[int]:
 
 
 def start_attributes(event_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Attributes to set when a span is opened for this event."""
+    """Build attributes for a newly opened span.
+
+    Args:
+        event_name: Copilot hook event name.
+        payload: Sanitized event payload.
+    Returns:
+        Attributes to apply to the span.
+    """
     attrs: Dict[str, Any] = {
         "github_copilot.event": event_name,
         "agent.span.type": "github_copilot",
@@ -201,7 +235,12 @@ def start_attributes(event_name: str, payload: Dict[str, Any]) -> Dict[str, Any]
             attrs["agent.display_name"] = display_name
         description = payload.get("agentDescription")
         if description:
-            attrs["agent.description"] = _safe_text(description)
+            preview = _content_value(description)
+            length = _content_length(description)
+            if preview is not None:
+                attrs["agent.description"] = preview
+            elif length is not None:
+                attrs["agent.description.length"] = length
         attrs["agent.handoff.from"] = "github-copilot"
 
     return attrs
@@ -210,7 +249,11 @@ def start_attributes(event_name: str, payload: Dict[str, Any]) -> Dict[str, Any]
 def end_attributes(event_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Attributes/status to apply when a span is closed for this event.
 
-    Returns {"attributes": {...}, "is_error": bool, "error_message": str|None}.
+    Args:
+        event_name: Copilot hook event name.
+        payload: Sanitized event payload.
+    Returns:
+        A dict containing attributes, error status, and an optional message.
     """
     attrs: Dict[str, Any] = {}
     is_error = False
