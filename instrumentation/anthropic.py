@@ -22,6 +22,11 @@ def _field(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
+def _is_number(value: Any) -> bool:
+    """True for real numeric token counts, excluding bool (a subclass of int)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _safe_get(obj: Any, path: str, default: Any = None) -> Any:
     cur = obj
     for part in path.split("."):
@@ -71,10 +76,20 @@ def _safe_value(value: Any, depth: int = 0) -> Any:
 def _json_attr(value: Any) -> Optional[str]:
     if value is None:
         return None
+    limit = _limit()
     try:
-        return json.dumps(_safe_value(value), ensure_ascii=False)[:_limit()]
+        encoded = json.dumps(_safe_value(value), ensure_ascii=False)
     except Exception:
-        return str(value)[:_limit()]
+        try:
+            return json.dumps({"repr": str(value)[:limit]}, ensure_ascii=False)
+        except Exception:
+            return None
+    if len(encoded) <= limit:
+        return encoded
+    try:
+        return json.dumps({"truncated": True, "preview": encoded[:limit]}, ensure_ascii=False)
+    except Exception:
+        return None
 
 
 def _request_model(args: Tuple[Any, ...], kwargs: Mapping[str, Any]) -> Any:
@@ -108,15 +123,24 @@ def _usage(resp: Any) -> Dict[str, Any]:
     usage = _field(resp, "usage")
     if usage is None:
         return {}
-    result = {}
+    result: Dict[str, Any] = {}
     for name in ("input_tokens", "output_tokens", "cache_creation_input_tokens",
-                 "cache_read_input_tokens", "thinking_tokens", "cache_creation", "cache_read"):
+                 "cache_read_input_tokens", "thinking_tokens"):
         value = _field(usage, name)
-        if value is not None:
+        if _is_number(value):
             result[name] = value
+
+    cache_creation = _field(usage, "cache_creation")
+    if _is_number(cache_creation):
+        result["cache_creation"] = cache_creation
+    elif cache_creation is not None:
+        for name in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"):
+            value = _field(cache_creation, name)
+            if _is_number(value):
+                result["cache_creation_" + name] = value
     details = _field(usage, "output_tokens_details") or _field(usage, "thinking")
     thinking = _field(details, "thinking_tokens") if details is not None else None
-    if thinking is not None:
+    if _is_number(thinking):
         result["thinking_tokens"] = thinking
     return result
 
@@ -173,26 +197,31 @@ def _record_metrics(
 
 def _start_attrs(model: Any, args: Tuple[Any, ...], kwargs: Mapping[str, Any]) -> Dict[str, Any]:
     attrs: Dict[str, Any] = {"llm.vendor": "anthropic", "gen_ai.system": "anthropic"}
-    if model:
-        attrs.update({"llm.model": model, "gen_ai.request.model": model})
-    payload = _request_payload(args, kwargs)
-    messages = payload.get("messages")
-    if isinstance(messages, (list, tuple)):
-        prompt_parts = []
-        for message in messages[:_MAX_ITEMS]:
-            role, content = _field(message, "role"), _field(message, "content")
-            text = _content_text(content)
-            if text:
-                prompt_parts.append((str(role) + ": " if role else "") + text)
-        prompt = "\n".join(prompt_parts)
-        if prompt:
-            attrs["llm.prompt"] = prompt[:_limit()]
-            attrs["gen_ai.prompt"] = prompt[:_limit()]
-    for key, attr in (("messages", "llm.anthropic.messages"), ("system", "llm.anthropic.system"),
-                      ("tools", "llm.anthropic.tools")):
-        encoded = _json_attr(payload.get(key))
-        if encoded:
-            attrs[attr] = encoded
+    try:
+        if model:
+            attrs.update({"llm.model": model, "gen_ai.request.model": model})
+        payload = _request_payload(args, kwargs)
+        messages = payload.get("messages")
+        if isinstance(messages, (list, tuple)):
+            prompt_parts = []
+            for message in messages[:_MAX_ITEMS]:
+                role, content = _field(message, "role"), _field(message, "content")
+                text = _content_text(content)
+                if text:
+                    prompt_parts.append((str(role) + ": " if role else "") + text)
+            prompt = "\n".join(prompt_parts)
+            if prompt:
+                attrs["llm.prompt"] = prompt[:_limit()]
+                attrs["gen_ai.prompt"] = prompt[:_limit()]
+        for key, attr in (("messages", "llm.anthropic.messages"),
+                          ("system", "llm.anthropic.system"),
+                          ("tools", "llm.anthropic.tools")):
+            encoded = _json_attr(payload.get(key))
+            if encoded:
+                attrs[attr] = encoded
+    except Exception:
+        # Request-attribute capture must never break the wrapped SDK call.
+        pass
     return attrs
 
 
@@ -326,6 +355,8 @@ def _finish(
     if usage:
         response_usage.update(usage)
     for key, value in response_usage.items():
+        if not (_is_number(value) or isinstance(value, str)):
+            continue
         span.set_attribute("llm.usage." + key, value)
         span.set_attribute("gen_ai.usage." + key, value)
     if response_usage.get("input_tokens") is not None:
@@ -367,12 +398,21 @@ class _StreamProxy:
         self._trace_state = _StreamTraceState()
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
         value = getattr(self._stream, name)
         if name == "text_stream":
             return self._wrap_text_stream(value)
         if name in {"get_final_message", "get_final_text", "until_done"}:
             return self._wrap_terminal_method(name, value)
         return value
+
+    def __del__(self) -> None:
+        try:
+            if not self._done:
+                self._finish()
+        except Exception:
+            pass
 
     def _snapshot(self) -> Any:
         if self._final_snapshot is not None:
@@ -593,10 +633,12 @@ def _make_stream(
     args: Tuple[Any, ...] = (),
     kwargs: Optional[Mapping[str, Any]] = None,
     span_state: Optional[Tuple[Any, float, Optional[Callable[..., Any]]]] = None,
-) -> _StreamProxy:
+) -> Any:
     if span_state is None:
         span_state = _open_stream_span(model, args, kwargs or {})
     span, started, span_exit = span_state
+    if span is None:
+        return stream
     return _StreamProxy(stream, span, started, model, span_exit=span_exit)
 
 
@@ -605,16 +647,19 @@ def _open_stream_span(
     args: Tuple[Any, ...],
     kwargs: Mapping[str, Any],
 ) -> Tuple[Any, float, Optional[Callable[..., Any]]]:
-    tracer = _get_tracer("anthropic")
-    attrs = _start_attrs(model, args, kwargs)
     started = time.perf_counter()
-    if hasattr(tracer, "start_span"):
-        span = tracer.start_span("llm.anthropic.messages", attributes=attrs)
-        span.__enter__()
-        return span, started, None
-    context_manager = tracer.start_as_current_span("llm.anthropic.messages", attributes=attrs)
-    span = context_manager.__enter__()
-    return span, started, context_manager.__exit__
+    try:
+        tracer = _get_tracer("anthropic")
+        attrs = _start_attrs(model, args, kwargs)
+        if hasattr(tracer, "start_span"):
+            span = tracer.start_span("llm.anthropic.messages", attributes=attrs)
+            span.__enter__()
+            return span, started, None
+        context_manager = tracer.start_as_current_span("llm.anthropic.messages", attributes=attrs)
+        span = context_manager.__enter__()
+        return span, started, context_manager.__exit__
+    except Exception:
+        return None, started, None
 
 
 def _close_stream_span(
@@ -676,6 +721,30 @@ def _record_call_error(span: Any, exc: BaseException, model: Any, started: float
     _record_metrics(model, {}, time.perf_counter() - started, error=True)
 
 
+def _safe_finish(
+    span: Any,
+    response: Any,
+    request_model: Any,
+    started: float,
+    **kwargs: Any,
+) -> None:
+    """Run _finish but never let response-attribute capture break the caller."""
+    try:
+        _finish(span, response, request_model, started, **kwargs)
+    except Exception:
+        pass
+
+
+def _abort_stream_span(
+    span_state: Tuple[Any, float, Optional[Callable[..., Any]]],
+    model: Any,
+    exc: BaseException,
+) -> None:
+    span, started, span_exit = span_state
+    if span is not None:
+        _close_stream_span(span, started, model, span_exit, exc, None)
+
+
 @contextmanager
 def _trace_call(
     model: Any,
@@ -683,15 +752,37 @@ def _trace_call(
     kwargs: Mapping[str, Any],
 ) -> Iterator[Tuple[Any, float]]:
     started = time.perf_counter()
-    tracer = _get_tracer("anthropic")
-    with tracer.start_as_current_span(
-        "llm.anthropic.messages", attributes=_start_attrs(model, args, kwargs)
-    ) as span:
-        try:
-            yield span, started
-        except BaseException as exc:
-            _record_call_error(span, exc, model, started)
-            raise
+    span_cm: Any = None
+    span: Any = None
+    try:
+        tracer = _get_tracer("anthropic")
+        span_cm = tracer.start_as_current_span(
+            "llm.anthropic.messages", attributes=_start_attrs(model, args, kwargs)
+        )
+        span = span_cm.__enter__()
+    except Exception:
+        # Tracing setup failed - run the call untraced rather than raising.
+        span_cm, span = None, None
+    exc_info: Tuple[Any, Any, Any] = (None, None, None)
+    try:
+        yield span, started
+    except BaseException as exc:
+        exc_info = (type(exc), exc, getattr(exc, "__traceback__", None))
+        if span is not None:
+            try:
+                _record_call_error(span, exc, model, started)
+            except Exception:
+                pass
+        raise
+    finally:
+        if span_cm is not None:
+            try:
+                span_cm.__exit__(*exc_info)
+            except Exception:
+                try:
+                    span.end()
+                except Exception:
+                    pass
 
 
 def _call(
@@ -700,20 +791,20 @@ def _call(
     model = _request_model(args, kwargs)
     with _trace_call(model, args, kwargs) as (span, started):
         response = fn(self, *args, **kwargs)
-        _finish(span, response, model, started)
+        if span is not None:
+            _safe_finish(span, response, model, started)
         return response
 
 
 def _call_stream(
     fn: Callable[..., Any], self: Any, args: Tuple[Any, ...], kwargs: Mapping[str, Any]
-) -> _StreamProxy:
+) -> Any:
     model = _request_model(args, kwargs)
     span_state = _open_stream_span(model, args, kwargs)
     try:
         stream = fn(self, *args, **kwargs)
     except BaseException as exc:
-        span, started, span_exit = span_state
-        _close_stream_span(span, started, model, span_exit, exc, None)
+        _abort_stream_span(span_state, model, exc)
         raise
     return _make_stream(stream, model, args, kwargs, span_state)
 
@@ -724,20 +815,20 @@ async def _call_async(
     model = _request_model(args, kwargs)
     with _trace_call(model, args, kwargs) as (span, started):
         response = await fn(self, *args, **kwargs)
-        _finish(span, response, model, started)
+        if span is not None:
+            _safe_finish(span, response, model, started)
         return response
 
 
 async def _call_stream_async(
     fn: Callable[..., Any], self: Any, args: Tuple[Any, ...], kwargs: Mapping[str, Any]
-) -> _StreamProxy:
+) -> Any:
     model = _request_model(args, kwargs)
     span_state = _open_stream_span(model, args, kwargs)
     try:
         stream = await fn(self, *args, **kwargs)
     except BaseException as exc:
-        span, started, span_exit = span_state
-        _close_stream_span(span, started, model, span_exit, exc, None)
+        _abort_stream_span(span_state, model, exc)
         raise
     return _make_stream(stream, model, args, kwargs, span_state)
 
@@ -771,16 +862,14 @@ def _wrap_stream(fn: Callable[..., Any]) -> Callable[..., Any]:
         try:
             result = fn(self, *args, **kwargs)
         except BaseException as exc:
-            span, started, span_exit = span_state
-            _close_stream_span(span, started, model, span_exit, exc, None)
+            _abort_stream_span(span_state, model, exc)
             raise
         if inspect.isawaitable(result):
-            async def await_stream() -> _StreamProxy:
+            async def await_stream() -> Any:
                 try:
                     stream = await result
                 except BaseException as exc:
-                    span, started, span_exit = span_state
-                    _close_stream_span(span, started, model, span_exit, exc, None)
+                    _abort_stream_span(span_state, model, exc)
                     raise
                 return _make_stream(stream, model, args, kwargs, span_state)
             return await_stream()

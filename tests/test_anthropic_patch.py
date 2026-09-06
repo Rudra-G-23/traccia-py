@@ -2,6 +2,8 @@
 
 import asyncio
 import contextlib
+import gc
+import json
 import sys
 import types
 
@@ -1009,3 +1011,188 @@ def test_async_close_error_marks_span_as_failed(monkeypatch):
 def test_patch_returns_false_when_anthropic_cannot_be_imported(monkeypatch):
     monkeypatch.setitem(sys.modules, "anthropic", None)
     assert anthropic_mod.patch_anthropic() is False
+
+
+class _BrokenTracer:
+    """Every entry point raises - stands in for a misconfigured tracer."""
+
+    def start_span(self, *args, **kwargs):
+        raise RuntimeError("tracer unavailable")
+
+    def start_as_current_span(self, *args, **kwargs):
+        raise RuntimeError("tracer unavailable")
+
+
+def test_instrumentation_failure_does_not_break_sync_create(monkeypatch):
+    class Messages:
+        def create(self, **kwargs):
+            return {
+                "id": "ok",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+    class AsyncMessages:
+        async def create(self, **kwargs):
+            return {"usage": None}
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: _BrokenTracer())
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    assert anthropic_mod.patch_anthropic() is True
+    result = Messages().create(model="claude-x", messages=[{"role": "user", "content": "hi"}])
+    assert result["content"][0]["text"] == "hi"
+
+
+def test_instrumentation_failure_does_not_break_streaming(monkeypatch):
+    class Messages:
+        def create(self, **kwargs):
+            assert kwargs["stream"] is True
+            return iter(
+                [{"type": "message_start", "message": {"id": "m"}}, {"type": "message_stop"}]
+            )
+
+    class AsyncMessages:
+        async def create(self, **kwargs):
+            return {"usage": None}
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: _BrokenTracer())
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+    stream = Messages().create(model="claude-x", stream=True)
+    assert [event["type"] for event in stream] == ["message_start", "message_stop"]
+
+
+def test_finish_failure_does_not_break_sync_create(monkeypatch):
+    class Messages:
+        def create(self, **kwargs):
+            return {
+                "id": "ok",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {"input_tokens": 2, "output_tokens": 3},
+            }
+
+    class AsyncMessages:
+        async def create(self, **kwargs):
+            return {"usage": None}
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("finish blew up")
+
+    monkeypatch.setattr(anthropic_mod, "_finish", boom)
+
+    anthropic_mod.patch_anthropic()
+    result = Messages().create(model="claude-x", messages=[{"role": "user", "content": "hi"}])
+    assert result["content"][0]["text"] == "done"
+    assert tracer.spans[0].exited == 1
+
+
+def test_usage_flattens_cache_creation_object(monkeypatch):
+    class CacheCreation:
+        ephemeral_5m_input_tokens = 3
+        ephemeral_1h_input_tokens = 1
+
+    class Usage:
+        input_tokens = 10
+        output_tokens = 4
+        cache_creation = CacheCreation()
+
+    class Response:
+        id = "msg_cc"
+        model = "claude-cc"
+        stop_reason = "end_turn"
+        content = [{"type": "text", "text": "ok"}]
+        usage = Usage()
+
+    class Messages:
+        def create(self, **kwargs):
+            return Response()
+
+    class AsyncMessages:
+        async def create(self, **kwargs):
+            return {"usage": None}
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+    Messages().create(model="claude-cc", messages=[{"role": "user", "content": "hi"}])
+
+    attrs = tracer.spans[0].attributes
+    assert attrs["llm.usage.cache_creation_ephemeral_5m_input_tokens"] == 3
+    assert attrs["llm.usage.cache_creation_ephemeral_1h_input_tokens"] == 1
+    assert "llm.usage.cache_creation" not in attrs
+    assert "gen_ai.usage.cache_creation" not in attrs
+    for key, value in attrs.items():
+        if key.startswith(("llm.usage.", "gen_ai.usage.")):
+            assert isinstance(value, (int, float, str)) and not isinstance(value, bool)
+
+
+def test_finish_skips_non_scalar_usage_values(monkeypatch):
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+    monkeypatch.setattr(anthropic_mod, "_compute_cost", lambda *args, **kwargs: None)
+
+    span = FakeSpan()
+    anthropic_mod._finish(
+        span,
+        {"model": "m", "usage": {"input_tokens": 5, "output_tokens": 2}},
+        "m",
+        0.0,
+        usage={"input_tokens": 5, "output_tokens": 2, "junk": object(), "flag": True},
+    )
+    assert span.attributes["llm.usage.input_tokens"] == 5
+    assert span.attributes["gen_ai.usage.output_tokens"] == 2
+    assert "llm.usage.junk" not in span.attributes
+    assert "llm.usage.flag" not in span.attributes
+
+
+def test_oversized_json_request_attrs_stay_valid_json(monkeypatch):
+    monkeypatch.setattr(anthropic_mod, "_limit", lambda: 120)
+    attrs = anthropic_mod._start_attrs(
+        "claude-x",
+        (),
+        {
+            "messages": [{"role": "user", "content": "x" * 400}] * 5,
+            "system": "s" * 400,
+            "tools": [{"name": "t", "description": "d" * 400}],
+        },
+    )
+    for key in ("llm.anthropic.messages", "llm.anthropic.system", "llm.anthropic.tools"):
+        parsed = json.loads(attrs[key])  # must not raise
+        assert isinstance(parsed, (dict, list))
+
+
+def test_abandoned_stream_proxy_finalizes_span_on_del(monkeypatch):
+    class Messages:
+        def create(self, **kwargs):
+            return iter(
+                [{"type": "message_start", "message": {"id": "m"}}, {"type": "message_stop"}]
+            )
+
+    class AsyncMessages:
+        async def create(self, **kwargs):
+            return {"usage": None}
+
+    _install_fake_sdk(monkeypatch, Messages, AsyncMessages)
+    tracer = FakeTracer()
+    monkeypatch.setattr(anthropic_mod, "_get_tracer", lambda name: tracer)
+    monkeypatch.setattr(anthropic_mod, "_record_metrics", lambda *args, **kwargs: None)
+
+    anthropic_mod.patch_anthropic()
+    proxy = Messages().create(model="claude-x", stream=True)
+    assert isinstance(proxy, anthropic_mod._StreamProxy)
+    assert tracer.spans[0].exited == 0
+
+    del proxy
+    gc.collect()
+
+    assert tracer.spans[0].exited == 1
