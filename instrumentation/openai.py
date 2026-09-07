@@ -177,7 +177,14 @@ def patch_openai() -> bool:
                 attributes["llm.prompt"] = prompt_text
             t0 = time.perf_counter()
             with tracer.start_as_current_span("llm.openai.chat.completions", attributes=attributes) as span:
+                decision = None
                 try:
+                    from traccia.governance.pep import enforce_llm_call, finish_llm_call
+                    from traccia.governance.policy import AgentBlockedError
+
+                    decision = enforce_llm_call(kwargs)
+                    if kwargs.get("model") and kwargs.get("model") != model:
+                        span.set_attribute("llm.model", kwargs["model"])
                     resp = create_fn(*args, **kwargs)
                     # capture model from response if not already set
                     resp_model = getattr(resp, "model", None) or (_safe_get(resp, "model"))
@@ -221,9 +228,15 @@ def patch_openai() -> bool:
                         duration=duration_val,
                         cost=cost_val
                     )
-                    
+                    finish_llm_call(decision, actual_usd=cost_val)
                     return resp
                 except Exception as exc:
+                    try:
+                        from traccia.governance.pep import finish_llm_call as _finish
+                        from traccia.governance.policy import AgentBlockedError as _Blocked
+                        _finish(decision, release=True)
+                    except Exception:
+                        pass
                     span.record_exception(exc)
                     span.set_status(SpanStatus.ERROR, str(exc))
                     try:
@@ -380,7 +393,11 @@ def patch_openai_responses() -> bool:
             
             t0 = time.perf_counter()
             with tracer.start_as_current_span("llm.openai.responses", attributes=attributes) as span:
+                decision = None
                 try:
+                    from traccia.governance.pep import enforce_llm_call, finish_llm_call
+
+                    decision = enforce_llm_call(kwargs)
                     resp = await create_fn(*args, **kwargs)
                     
                     # Extract response details
@@ -435,9 +452,14 @@ def patch_openai_responses() -> bool:
                         duration=duration_val,
                         cost=cost_val
                     )
-                    
+                    finish_llm_call(decision, actual_usd=cost_val)
                     return resp
                 except Exception as exc:
+                    try:
+                        from traccia.governance.pep import finish_llm_call as _finish
+                        _finish(decision, release=True)
+                    except Exception:
+                        pass
                     span.record_exception(exc)
                     span.set_status(SpanStatus.ERROR, str(exc))
                     try:

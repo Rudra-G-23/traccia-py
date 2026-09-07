@@ -198,6 +198,13 @@ def observe(
 
             with tracer.start_as_current_span(span_name, attributes=span_attrs) as span:
                 try:
+                    if inferred_type == "tool":
+                        from traccia.governance.pep import enforce_tool_call
+
+                        enforce_tool_call(
+                            span_name,
+                            {k: v for k, v in bound.arguments.items() if k != "self"},
+                        )
                     result = func(*args, **kwargs)
                     # For guardrail-typed spans: auto-set triggered from bool return value
                     # so developers don't need to manually call get_current_span().
@@ -259,6 +266,13 @@ def observe(
 
             async with tracer.start_as_current_span(span_name, attributes=span_attrs) as span:
                 try:
+                    if inferred_type == "tool":
+                        from traccia.governance.pep import enforce_tool_call
+
+                        enforce_tool_call(
+                            span_name,
+                            {k: v for k, v in bound.arguments.items() if k != "self"},
+                        )
                     result = await func(*args, **kwargs)
                     # For guardrail-typed spans: auto-set triggered from bool return value.
                     if inferred_type == "guardrail" and isinstance(result, bool):

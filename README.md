@@ -20,6 +20,7 @@ Built on OpenTelemetry standards, Traccia provides automatic instrumentation, to
 - **Production-Ready Architecture**: Rate limiting, error handling, configuration validation, and reliable flushing
 - **Guardrail Detection**: Passive detection of AI safety controls, provider-native safeguards, and custom guardrails
 - **AI Governance and Compliance**: EU AI Act and HIPAA-oriented evidence, transparency records, integrity verification, and PII/PHI redaction helpers
+- **Runtime Policies**: `@govern` can deny or reshape this LLM or tool call (Spend Cap, Model Boundary, Loop Cap) against the Traccia platform
 - **Type-Safe Configuration**: Full Pydantic validation and configuration management
 - **High Performance**: Efficient batching, async support, and low-overhead instrumentation
 - **Security Controls**: No secrets in logs and configurable data truncation
@@ -1287,24 +1288,46 @@ Traccia adds **GovernanceEvent** attributes on spans automatically (event type, 
 | Decorator | Purpose | Requires Traccia platform |
 |-----------|---------|---------------------------|
 | `@observe` | Observability only — creates trace spans | No (works with any OTLP backend) |
-| `@govern` | Observability **plus** runtime policy enforcement | **Yes** — calls the Traccia agent-status API before each run |
+| `@govern` | Observability **plus** runtime policy enforcement | **Yes** |
 
-`@govern` is for teams using the Traccia platform to block or warn on agent execution based on live policies. Open-source or self-hosted tracing-only users should use `@observe`.
+`@govern` does two things:
 
-Policy URLs are derived automatically from your tracing endpoint (`{base}/api/v1/agents/{agent_id}/status`). You do **not** need a `[governance]` section in `traccia.toml` unless you use a non-standard deployment.
+1. Checks agent status before the function body (can warn or stop the **next** run for after-ingest policies).
+2. Turns on a per-call check for **this** LLM or tool call (Spend Cap, Model Boundary, Loop Cap). You do not call `check_policy()` yourself when using an instrumented LLM client and `@observe(as_type="tool")`.
+
+Tracing-only or self-hosted users should use `@observe`.
 
 ```python
-from traccia import init, govern
-from traccia.governance import AgentBlockedError
+from openai import OpenAI
+from traccia import init, observe, govern, AgentBlockedError
 
-init(api_key="...", endpoint="https://api.traccia.ai/v1/traces")
+init(api_key="...", endpoint="https://api.traccia.ai/v2/traces", agent_id="my-agent")
+client = OpenAI()
 
-@govern(agent_id="my-agent", fail_open=False, name="run_agent")
+@observe(name="lookup_order", as_type="tool")
+def lookup_order(order_id: str) -> dict:
+    return {"order_id": order_id, "status": "shipped"}
+
+@govern(fail_open=False, name="run_agent")
 def run_agent(prompt: str) -> str:
-    return call_llm(prompt)
+    lookup_order("ORD-1")
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.choices[0].message.content or ""
+
+try:
+    run_agent("hello")
+except AgentBlockedError as exc:
+    print(exc.reasons, exc.decision_id, exc.remaining_budget_usd)
 ```
 
-Set `TRACCIA_AGENT_ID` instead of passing `agent_id` on each decorator. On hard block, `@govern` raises `AgentBlockedError`.
+Identity comes from `init(agent_id=...)` (or `TRACCIA_AGENT_ID`). Pass `agent_id` on `@govern` only to override in a multi-agent process. `fail_open=True` (default) lets the agent continue if Traccia is unreachable. On Block deny, `@govern` raises `AgentBlockedError`. Observe and Warn still let the call proceed and record a match.
+
+For a custom tool that is **not** wrapped with `@observe(as_type="tool")`, call `check_policy(action={"type": "tool_call", "name": "refund"}, context={"input": {"amount": amount}})` yourself.
+
+Policies in the app: [Policies](https://traccia.ai/docs/platform/policies). SDK guide: [Governance in the SDK](https://traccia.ai/docs/sdk/governance).
 
 **Advanced (optional):** override endpoints or cache TTL in `traccia.toml`:
 

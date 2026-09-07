@@ -24,6 +24,7 @@ def test_skips_platform_bookkeeping_urls():
         "http://localhost:8001/api/v1/prompt-runtime/prompts/support-reply"
     )
     assert _should_skip_http_instrumentation("https://api.traccia.ai/v2/traces")
+    assert _should_skip_http_instrumentation("https://app.traccia.ai/api/v1/policy/check")
 
 
 def test_does_not_skip_ordinary_http():
