@@ -358,12 +358,15 @@ class TestNormalizer:
                 "output_cost_per_token": 0.000015,
                 "cache_creation_input_token_cost": 0.00000375,
                 "cache_read_input_token_cost": 0.0000003,
+                "max_input_tokens": 200000,
+                "max_output_tokens": 8192,
             }
         }
         result = normalize(raw)
         entry = result["claude-3"]
         assert "cache_write" in entry
         assert "cached_prompt" in entry
+        assert entry["_max_output_tokens"] == 8192
 
     def test_diff_detects_changed_keys(self):
         from traccia.pricing_normalizer import diff_models

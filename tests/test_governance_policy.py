@@ -86,6 +86,7 @@ def test_check_agent_status_allowed(mock_load_config, mock_session):
     mock_session.get.assert_called_once()
     args, kwargs = mock_session.get.call_args
     assert args[0] == "https://api.traccia.ai/api/v1/agents/agent-1/status"
+    mock_session.post.assert_not_called()
 
 
 @patch("traccia.governance.policy._http_session")

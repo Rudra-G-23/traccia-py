@@ -79,6 +79,8 @@ def _normalize_entry(model_id: str, entry: dict) -> Optional[Dict[str, Any]]:
         model_entry["_max_tokens"] = entry["max_tokens"]
     if entry.get("max_input_tokens"):
         model_entry["_max_input_tokens"] = entry["max_input_tokens"]
+    if entry.get("max_output_tokens"):
+        model_entry["_max_output_tokens"] = entry["max_output_tokens"]
 
     return model_entry
 

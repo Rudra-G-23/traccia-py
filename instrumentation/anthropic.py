@@ -123,7 +123,11 @@ def patch_anthropic() -> bool:
             attributes["llm.model"] = model
         t0 = time.perf_counter()
         with tracer.start_as_current_span("llm.anthropic.messages", attributes=attributes) as span:
+            decision = None
             try:
+                from traccia.governance.pep import enforce_llm_call, finish_llm_call
+
+                decision = enforce_llm_call(kwargs)
                 resp = create_fn(self, *args, **kwargs)
                 usage = getattr(resp, "usage", None) or resp.get("usage") if isinstance(resp, dict) else None
                 input_tokens_val = None
@@ -161,9 +165,14 @@ def patch_anthropic() -> bool:
                     duration=duration_val,
                     cost=cost_val
                 )
-                
+                finish_llm_call(decision, actual_usd=cost_val)
                 return resp
             except Exception as exc:
+                try:
+                    from traccia.governance.pep import finish_llm_call as _finish
+                    _finish(decision, release=True)
+                except Exception:
+                    pass
                 span.record_exception(exc)
                 span.set_status(SpanStatus.ERROR, str(exc))
                 try:

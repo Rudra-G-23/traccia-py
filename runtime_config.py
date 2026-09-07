@@ -13,6 +13,7 @@ _run_agent_name: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _run_env: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("traccia_run_env", default=None)
 _run_tenant_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("traccia_run_tenant_id", default=None)
 _run_project_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("traccia_run_project_id", default=None)
+_run_pep_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar("traccia_run_pep_enabled", default=False)
 
 # Global runtime configuration state
 _config = {
@@ -142,6 +143,10 @@ def get_env() -> Optional[str]:
     return _config["env"]
 
 
+def pep_enabled() -> bool:
+    return bool(_run_pep_enabled.get())
+
+
 def set_debug(value: bool) -> None:
     _config["debug"] = value
 
@@ -196,6 +201,7 @@ def run_identity(
     env: Optional[str] = None,
     tenant_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    pep_enabled: Optional[bool] = None,
 ):
     """
     Context manager to set run-scoped agent identity for the current context (e.g. one request).
@@ -216,6 +222,8 @@ def run_identity(
             resets.append((_run_tenant_id, _run_tenant_id.set(tenant_id)))
         if project_id is not None:
             resets.append((_run_project_id, _run_project_id.set(project_id)))
+        if pep_enabled is not None:
+            resets.append((_run_pep_enabled, _run_pep_enabled.set(bool(pep_enabled))))
         yield
     finally:
         for var, token in reversed(resets):

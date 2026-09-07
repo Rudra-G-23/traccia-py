@@ -2,9 +2,15 @@
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-09-07
+
 ### Added
+- Per-call policy check under `@govern` (`governance/pep.py`): `POST /api/v1/policy/check` on instrumented LLM and tool spans (Spend Cap, Model Boundary, Loop Cap). Optional `check_policy()` for custom tools.
+- `@govern` inherits `agent_id` from `init` / `TRACCIA_AGENT_ID`; pass `agent_id=` only to override
+- `AgentBlockedError.decision_id`, `remaining_budget_usd`, and `reasons` on deny
+- README example: instrumented OpenAI + tool observe under `@govern`
 - Redaction allowlist for `traccia.policy.*` span attributes (same pattern as `traccia.prompt.*`)
-- HTTP client skip for `@govern()` status/block calls and prompt-runtime fetches, matching the Node SDK
+- HTTP client skip for `@govern()` status/block calls, policy check/settle, and prompt-runtime fetches, matching the Node SDK
 
 ## [0.1.27] - 2026-08-14
 

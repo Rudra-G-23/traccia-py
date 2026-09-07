@@ -23,6 +23,12 @@ DEFAULT_BLOCK_PATH = "/api/v1/agents/{agent_id}/blocks"
 class AgentBlockedError(Exception):
     """Raised when an agent execution is hard blocked by governance policy."""
 
+    def __init__(self, message: str, *, decision_id=None, remaining_budget_usd=None, reasons=None):
+        super().__init__(message)
+        self.decision_id = decision_id
+        self.remaining_budget_usd = remaining_budget_usd
+        self.reasons = reasons or []
+
 
 class AgentStatusCache:
     """Thread-safe TTL cache for agent status responses."""

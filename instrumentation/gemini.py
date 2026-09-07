@@ -229,12 +229,22 @@ def _build_sync_wrapper(original_create):
         with tracer.start_as_current_span(
             "llm.gemini.interaction", attributes=attributes
         ) as span:
+            decision = None
             try:
+                from traccia.governance.pep import enforce_llm_call, finish_llm_call
+
+                decision = enforce_llm_call(kwargs)
                 resp = original_create(self, *args, **kwargs)
                 if not streaming:
                     _populate_span(span, resp, model, t0)
+                finish_llm_call(decision)
                 return resp
             except Exception as exc:
+                try:
+                    from traccia.governance.pep import finish_llm_call as _finish
+                    _finish(decision, release=True)
+                except Exception:
+                    pass
                 span.record_exception(exc)
                 span.set_status(SpanStatus.ERROR, str(exc))
                 _record_exception_metric(model)
@@ -274,12 +284,22 @@ def _build_async_wrapper(original_create):
         with tracer.start_as_current_span(
             "llm.gemini.interaction", attributes=attributes
         ) as span:
+            decision = None
             try:
+                from traccia.governance.pep import enforce_llm_call, finish_llm_call
+
+                decision = enforce_llm_call(kwargs)
                 resp = await original_create(self, *args, **kwargs)
                 if not streaming: 
                     _populate_span(span, resp, model, t0)
+                finish_llm_call(decision)
                 return resp
             except Exception as exc:
+                try:
+                    from traccia.governance.pep import finish_llm_call as _finish
+                    _finish(decision, release=True)
+                except Exception:
+                    pass
                 span.record_exception(exc)
                 span.set_status(SpanStatus.ERROR, str(exc))
                 _record_exception_metric(model)
