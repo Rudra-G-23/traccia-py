@@ -1,12 +1,5 @@
-"""Local per-session event log for GitHub Copilot hook events.
+"""Local per-session event log for GitHub Copilot hook events."""
 
-Each hook invocation is a fresh OS process, so span state cannot live in
-memory across events -- it is buffered here as JSON Lines and replayed once,
-at sessionEnd (or via `traccia copilot flush` for orphaned sessions), by
-spans.build_trace(). Keeping each hook invocation to a local disk append (no
-network call) is what keeps preToolUse/postToolUse from adding export latency
-to a tool call Copilot is waiting on -- see docs/github-copilot-integration.md.
-"""
 from __future__ import annotations
 
 import json
@@ -30,10 +23,6 @@ _CLAIM_SUFFIX = ".flushing"
 
 def default_state_dir() -> Path:
     """Return the configured or per-user default Copilot journal directory."""
-    # hook.py/flush.py run in a fresh subprocess that never calls
-    # traccia.init()/start_tracing(), so runtime_config's in-process globals
-    # are never populated here -- read straight from traccia.toml/env instead,
-    # exactly like hook.py does for its own enabled/capture_content lookup.
     try:
         from traccia import config as sdk_config
 
@@ -46,8 +35,6 @@ def default_state_dir() -> Path:
 
 
 def _safe_session_filename(session_id: str) -> str:
-    # session_id is attacker/tool-controlled input read from stdin -- never
-    # build a filesystem path from it without sanitizing first.
     cleaned = _SESSION_ID_RE.sub("_", str(session_id))[:200]
     return f"{cleaned or 'unknown'}.jsonl"
 
@@ -93,17 +80,9 @@ def append_event(
     """Append one event record to this session's log (creates the file/dir if needed)."""
     record = {"event": event_name, "payload": payload, "received_at": time.time()}
     line = (json.dumps(record, default=str) + "\n").encode("utf-8")
-    # O_APPEND makes each write seek-to-end first. A single short write() is
-    # atomic against concurrent appenders on POSIX only while it stays under
-    # PIPE_BUF (4096 on Linux) -- which a record can exceed once
-    # capture_content=True inlines size-capped tool/prompt text. Take an
-    # exclusive advisory lock for the write so concurrent hook processes for the
-    # same session can never interleave a partial line, regardless of size.
     with _session_lock(session_id, state_dir):
         normal = session_log_path(session_id, state_dir)
         claimed = normal.with_name(normal.name + _CLAIM_SUFFIX)
-        # If a flush already owns the journal, append to that same claimed
-        # file so a late hook event cannot create a silently orphaned sibling.
         path = claimed if claimed.exists() else normal
         fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
         try:
@@ -135,17 +114,23 @@ def read_events(session_id: str, state_dir: Optional[Path] = None) -> List[Dict[
 
 
 def has_end_event(session_id: str, state_dir: Optional[Path] = None) -> bool:
-    """True if this session's log already contains a sessionEnd record.
-
-    Cheap scan (no JSON parse) so `flush --all` can tell a genuinely-finished
-    session apart from one that's still live.
-    """
+    """True if this session's log already contains a sessionEnd record."""
+    
     path = session_log_path(session_id, state_dir)
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            return any('"event": "sessionEnd"' in line or '"event":"sessionEnd"' in line for line in fh)
+            for line in fh:
+                line = line.strip()
+                if not line or '"sessionEnd"' not in line:
+                    continue  # cheap pre-filter before the JSON parse
+                try:
+                    if json.loads(line).get("event") == "sessionEnd":
+                        return True
+                except json.JSONDecodeError:
+                    continue
     except OSError:
         return False
+    return False
 
 
 def clear_session(session_id: str, state_dir: Optional[Path] = None) -> None:
@@ -157,19 +142,8 @@ def clear_session(session_id: str, state_dir: Optional[Path] = None) -> None:
 
 
 def claim_session(session_id: str, state_dir: Optional[Path] = None) -> Optional[Path]:
-    """Atomically take exclusive ownership of a session log for flushing.
-
-    The claim marker is ``<id>.jsonl.flushing``, created with ``O_CREAT|O_EXCL``
-    -- the kernel guarantees exactly one caller wins that create, so a
-    concurrent flush or a re-delivered ``sessionEnd`` gets ``None`` and a
-    session is never exported twice. Any pending ``<id>.jsonl`` data is then
-    moved into the marker. Returns the claimed path, or ``None`` if someone
-    else holds the claim or there was nothing buffered.
-
-    A claim orphaned by a hard-killed flush is *not* stolen here (no liveness
-    signal); ``flush_all`` sweeps stale ``.flushing`` files instead -- see
-    ``list_stale_claims``.
-    """
+    """Atomically take exclusive ownership of a session log for flushing."""
+    
     with _session_lock(session_id, state_dir):
         src = session_log_path(session_id, state_dir)
         claimed = src.with_name(src.name + _CLAIM_SUFFIX)
@@ -240,6 +214,43 @@ def restore_claim(claimed_path: Path) -> None:
             pass
 
 
+def salvage_late_appends(
+    claimed_path: Path,
+    byte_offset: Optional[int],
+    state_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Move records appended to a claimed journal after ``byte_offset`` back to a
+    normal (unclaimed) journal, then drop the claim.
+
+    Returns the normal journal path if anything was salvaged, else ``None``.
+    """
+    claimed_path = Path(claimed_path)
+    name = claimed_path.name
+    if name.endswith(_CLAIM_SUFFIX):
+        name = name[: -len(_CLAIM_SUFFIX)]
+    session_id = Path(name).stem
+    normal = claimed_path.with_name(name)
+
+    with _session_lock(session_id, state_dir):
+        try:
+            data = claimed_path.read_bytes()
+        except OSError:
+            return None
+        tail = data[byte_offset:] if byte_offset and byte_offset < len(data) else b""
+        salvaged = bool(tail.strip())
+        if salvaged:
+            fd = os.open(str(normal), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, tail if tail.endswith(b"\n") else tail + b"\n")
+            finally:
+                os.close(fd)
+        try:
+            claimed_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return normal if salvaged else None
+
+
 def archive_failed_claim(claimed_path: Path) -> Optional[Path]:
     """Move a claimed log whose export failed into a ``failed/`` sibling dir.
 
@@ -273,8 +284,6 @@ def list_sessions(state_dir: Optional[Path] = None) -> List[str]:
     base = Path(state_dir) if state_dir else default_state_dir()
     if not base.exists():
         return []
-    # *.jsonl only -- never picks up "<id>.jsonl.flushing" claimed logs or the
-    # failed/ subdirectory (glob is non-recursive).
     return [p.stem for p in base.glob("*.jsonl")]
 
 

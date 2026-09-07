@@ -2,8 +2,8 @@
 
 Covers: mapping (event -> span shape), the local session-log state store,
 end-to-end span materialization (parent/child hierarchy, timing, redaction),
-the hook subprocess entry point (must never exit non-zero -- see
-docs/github-copilot-integration.md Section 6), and flush orchestration.
+the hook subprocess entry point (must never exit non-zero), and flush
+orchestration.
 """
 
 from __future__ import annotations
@@ -814,3 +814,172 @@ def test_install_hooks_quotes_spaced_interpreter_path(tmp_path, monkeypatch):
     cfg = json.loads((tmp_path / ".github" / "hooks" / "traccia.json").read_text())
     command = cfg["hooks"]["sessionStart"][0]["command"]
     assert command.startswith('"/opt/py 3.13/bin/python" -m traccia.integrations.github_copilot.hook')
+
+
+# ---------------------------------------------------------------------------
+# Regression: the persisted-payload pipeline
+# (strip_content_fields -> state journal -> build_trace), which the direct
+# build_trace tests above deliberately bypass by feeding raw dicts.
+# ---------------------------------------------------------------------------
+
+
+def _persist(event_name, payload, capture_content):
+    """Mirror hook.py: sanitize, then round-trip through the on-disk journal."""
+    return mapping.strip_content_fields(event_name, dict(payload), capture_content)
+
+
+def test_post_tool_use_output_survives_capture_content_pipeline():
+    # capture_content=True must yield the tool output, not silently drop it.
+    persisted = _persist(
+        "postToolUse",
+        {"toolName": "shell", "toolResult": {"resultType": "success", "textResultForLlm": "answer 42"}},
+        capture_content=True,
+    )
+    attrs = mapping.end_attributes("postToolUse", persisted)["attributes"]
+    assert attrs["agent.tool.output"] == "answer 42"
+    assert attrs["agent.tool.result_type"] == "success"
+
+
+def test_post_tool_use_output_length_survives_metadata_only_pipeline():
+    persisted = _persist(
+        "postToolUse",
+        {"toolName": "shell", "toolResult": {"resultType": "ok", "textResultForLlm": "x" * 30}},
+        capture_content=False,
+    )
+    assert persisted["toolResult"]["textResultForLlm"] == {"_stripped": True, "length": 30}
+    attrs = mapping.end_attributes("postToolUse", persisted)["attributes"]
+    assert attrs["agent.tool.output.length"] == 30
+    assert attrs["agent.tool.result_type"] == "ok"
+    assert "agent.tool.output" not in attrs
+
+
+def test_post_tool_events_strip_tool_args_by_default():
+    # toolArgs must be length-only for *every* tool event, not just preToolUse:
+    # a failing tool call is exactly where a malformed secret tends to be.
+    for event in ("postToolUse", "postToolUseFailure"):
+        persisted = _persist(
+            event,
+            {"toolName": "http", "toolArgs": {"token": "sk-supersecretvalue"}, "error": {"message": "boom"}},
+            capture_content=False,
+        )
+        assert persisted["toolArgs"] == {"_stripped": True, "length": len('{"token": "sk-supersecretvalue"}')}
+        assert "supersecret" not in json.dumps(persisted)
+
+
+def test_captured_content_is_redacted_before_it_touches_disk():
+    persisted = _persist(
+        "userPromptSubmitted",
+        {"prompt": "my email is alice@example.com, ping me"},
+        capture_content=True,
+    )
+    assert "alice@example.com" not in persisted["prompt"]
+    assert "[REDACTED_EMAIL]" in persisted["prompt"]
+
+
+def test_error_occurred_context_is_stripped_by_default_and_surfaced():
+    persisted = _persist(
+        "errorOccurred",
+        {"error": {"message": "boom"}, "errorContext": "trace referencing /home/u/secret.key"},
+        capture_content=False,
+    )
+    assert persisted["errorContext"] == {"_stripped": True, "length": len("trace referencing /home/u/secret.key")}
+
+    tracer, exporter = _make_tracer()
+    events = _events(
+        ("sessionStart", {"sessionId": "s1"}, 0),
+        ("errorOccurred", {**persisted, "sessionId": "s1"}, 1),
+        ("sessionEnd", {"sessionId": "s1"}, 2),
+    )
+    spans_mod.build_trace(tracer, events)
+    session_span = next(
+        s for s in exporter.get_finished_spans() if s.name == "github_copilot.session"
+    )
+    err_events = [e for e in session_span.events if e.name == "github_copilot.error"]
+    assert err_events and err_events[0].attributes["error.context.length"] == len(
+        "trace referencing /home/u/secret.key"
+    )
+
+
+def test_full_pipeline_hook_to_span_end_to_end(tmp_path):
+    # A whole session: hook subprocess -> journal -> flush -> exported spans.
+    raw = [
+        ("sessionStart", {"sessionId": "s1", "cwd": str(tmp_path), "source": "cli", "initialPrompt": "fix the bug"}),
+        ("preToolUse", {"sessionId": "s1", "toolName": "shell", "toolArgs": {"cmd": "pytest"}}),
+        ("postToolUse", {"sessionId": "s1", "toolName": "shell", "toolResult": {"resultType": "success", "textResultForLlm": "1 passed"}}),
+        ("sessionEnd", {"sessionId": "s1", "reason": "complete"}),
+    ]
+    for event_name, payload in raw:
+        with patch("subprocess.Popen"):  # don't actually spawn the detached flush
+            rc, out = _run_hook([event_name], json.dumps(payload), tmp_path)
+        assert rc == 0 and json.loads(out) == {}
+
+    tracer, exporter = _make_tracer()
+    events = state.read_events("s1", state_dir=tmp_path)
+    summary = spans_mod.build_trace(tracer, events)
+    assert summary == {"tool_spans": 1, "subagent_spans": 0, "errors": 0}
+
+    by_name = {s.name: s for s in exporter.get_finished_spans()}
+    assert set(by_name) == {"github_copilot.session", "github_copilot.tool.shell"}
+    tool = by_name["github_copilot.tool.shell"]
+    # metadata-only default: lengths, never content
+    assert tool.attributes["agent.tool.input.length"] == len('{"cmd": "pytest"}')
+    assert tool.attributes["agent.tool.output.length"] == len("1 passed")
+    assert tool.attributes["agent.tool.result_type"] == "success"
+    assert "agent.tool.output" not in tool.attributes
+    session = by_name["github_copilot.session"]
+    assert session.attributes["github_copilot.prompt.length"] == len("fix the bug")
+    assert session.attributes["github_copilot.session.end_reason"] == "complete"
+
+
+def test_has_end_event_ignores_session_end_inside_captured_content(tmp_path):
+    # A captured prompt that literally contains the sessionEnd marker must not
+    # make a still-live session look finished.
+    state.append_event(
+        "s1",
+        "userPromptSubmitted",
+        {"prompt": 'help me handle {"event": "sessionEnd"} in my parser'},
+        state_dir=tmp_path,
+    )
+    assert state.has_end_event("s1", state_dir=tmp_path) is False
+    state.append_event("s1", "sessionEnd", {"sessionId": "s1"}, state_dir=tmp_path)
+    assert state.has_end_event("s1", state_dir=tmp_path) is True
+
+
+def test_salvage_late_appends_keeps_only_the_tail(tmp_path):
+    p = tmp_path / "s1.jsonl.flushing"
+    p.write_text(
+        json.dumps({"event": "sessionStart", "payload": {}, "received_at": 1.0}) + "\n"
+        + json.dumps({"event": "sessionEnd", "payload": {}, "received_at": 2.0}) + "\n",
+        encoding="utf-8",
+    )
+    offset = p.stat().st_size
+    # a hook appends one more record after the claim was read
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"event": "errorOccurred", "payload": {}, "received_at": 3.0}) + "\n")
+
+    salvaged = state.salvage_late_appends(p, offset, state_dir=tmp_path)
+    assert salvaged == tmp_path / "s1.jsonl"
+    assert not p.exists()  # claim dropped
+    leftover = state.read_events_from_path(salvaged)
+    assert [e["event"] for e in leftover] == ["errorOccurred"]
+
+
+def test_flush_session_salvages_late_events_instead_of_full_reexport(tmp_path):
+    state.append_event("s1", "sessionStart", {"sessionId": "s1"}, state_dir=tmp_path)
+    state.append_event("s1", "sessionEnd", {"sessionId": "s1"}, state_dir=tmp_path)
+
+    real_export = flush_mod._export_events
+
+    def _export_then_late_append(events):
+        # simulate a hook writing after the claim was read but before we finish
+        claimed = next(tmp_path.glob("*.flushing"))
+        with open(claimed, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event": "errorOccurred", "payload": {}, "received_at": 9.0}) + "\n")
+        return {"tool_spans": 0, "subagent_spans": 0, "errors": 0}, True
+
+    with patch.object(flush_mod, "_export_events", side_effect=_export_then_late_append):
+        flush_mod.flush_session("s1", state_dir=tmp_path)
+
+    assert state.list_failed(state_dir=tmp_path) == []  # not parked for a full re-export
+    leftover = state.read_events("s1", state_dir=tmp_path)
+    assert [e["event"] for e in leftover] == ["errorOccurred"]

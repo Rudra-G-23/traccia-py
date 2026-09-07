@@ -207,6 +207,61 @@ enable_span_logging = false
         return 1
 
 
+def _doctor_github_copilot(config) -> int:
+    """Print GitHub Copilot hooks integration status. Returns the issue count."""
+    print("\nGitHub Copilot hooks integration:")
+    issues = 0
+
+    inst = config.instrumentation
+    if not inst.github_copilot:
+        print("   Disabled (instrumentation.github_copilot = false)")
+        return 0
+    print("   Enabled")
+    print(
+        "   • Content capture: "
+        + ("on (redacted, size-capped)" if inst.github_copilot_capture_content else "off (metadata only)")
+    )
+
+    hook_locations = [
+        Path.cwd() / ".github" / "hooks" / "traccia.json",
+        Path.home() / ".copilot" / "hooks" / "traccia.json",
+    ]
+    installed = [p for p in hook_locations if p.exists()]
+    if installed:
+        for p in installed:
+            print(f"   • Hook config: {p}")
+    else:
+        print("   No hook config in the usual spots (run `traccia copilot install-hooks`)")
+        print(f"      Looked in: {hook_locations[0]}")
+        print(f"                 {hook_locations[1]}")
+
+    try:
+        from traccia.integrations.github_copilot import state as copilot_state
+
+        state_dir = copilot_state.default_state_dir()
+        buffered = copilot_state.list_sessions()
+        failed = copilot_state.list_failed()
+        stale = copilot_state.list_stale_claims(60.0)
+        print(f"   • Journal dir: {state_dir}")
+        if buffered:
+            print(
+                f"   • {len(buffered)} buffered session(s) awaiting flush "
+                "(`traccia copilot flush --all`)"
+            )
+        if stale:
+            print(f"   • {len(stale)} stale claim(s) from an interrupted flush")
+        if failed:
+            print(
+                f"   {len(failed)} session(s) parked in failed/ "
+                "(`traccia copilot flush --retry-failed`)"
+            )
+            issues += 1
+    except Exception as exc:  # noqa: BLE001 - doctor must never crash
+        print(f"   Could not inspect the session journal: {exc}")
+
+    return issues
+
+
 def _doctor(args) -> int:
     """Validate configuration and diagnose common issues."""
     print("🩺 Running Traccia configuration diagnostics...\n")
@@ -272,7 +327,11 @@ def _doctor(args) -> int:
     else:
         print(f"❌ {message}")
         issues_found += 1
-    
+
+    # 3b. GitHub Copilot hooks integration
+    if is_valid and config is not None:
+        issues_found += _doctor_github_copilot(config)
+
     # 4. Environment variable mapping reference
     print("\n📖 Environment Variable Reference:")
     print("   Common variables:")
@@ -532,8 +591,7 @@ def _copilot_install_hooks(args: argparse.Namespace) -> int:
     """Write a GitHub Copilot hooks config that routes lifecycle events to Traccia.
 
     See docs.github.com/en/copilot/reference/hooks-reference for the config
-    format this generates, and docs/github-copilot-integration.md for why
-    each of these events is (or isn't) registered.
+    format this generates.
     """
     from traccia.integrations.github_copilot import mapping
 
@@ -765,8 +823,7 @@ For more information, visit: https://github.com/traccia-ai/traccia
         description=(
             "Generate a GitHub Copilot hooks configuration file that invokes "
             "`python -m traccia.integrations.github_copilot.hook <event>` for each "
-            "lifecycle event Traccia knows how to map to a span. See "
-            "docs/github-copilot-integration.md for the exact event -> span mapping."
+            "lifecycle event Traccia knows how to map to a span."
         ),
     )
     copilot_install.add_argument(

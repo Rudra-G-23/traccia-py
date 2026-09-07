@@ -1,11 +1,5 @@
-"""Build Traccia spans from a GitHub Copilot session's buffered hook events.
+"""Build Traccia spans from a GitHub Copilot session's buffered hook events."""
 
-Runs once per session (from flush.py), not once per hook invocation -- see
-docs/github-copilot-integration.md for why. Uses each event's own recorded
-timestamp (via Tracer.start_span(start_time=...) / Span.end(end_time=...))
-so span duration reflects when things actually happened, not when this
-materializer ran.
-"""
 from __future__ import annotations
 
 from collections import defaultdict, deque
@@ -17,12 +11,8 @@ from traccia.tracer.span import SpanStatus
 
 
 def _vcs_attributes(cwd: Optional[str]) -> Dict[str, str]:
-    """Best-effort repo/branch/commit for a session's working directory.
-
-    Runs here (in flush.py's materialization step), never on Copilot's blocking
-    hook path. Never raises; capped at a couple seconds; returns ``{}`` when
-    ``cwd`` isn't a git checkout or ``git`` isn't on PATH.
-    """
+    """Best-effort repo/branch/commit for a session's working directory."""
+    
     if not cwd:
         return {}
     import re
@@ -53,20 +43,13 @@ def _vcs_attributes(cwd: Optional[str]) -> Dict[str, str]:
         attrs["vcs.commit.sha"] = sha
     remote = _git("config", "--get", "remote.origin.url")
     if remote:
-        # Never let credentials in an embedded userinfo (https://user:token@host/…)
-        # ride along into a span attribute.
         attrs["vcs.repository.url"] = re.sub(r"//[^/@]*@", "//", remote)
     return attrs
 
 
 def _epoch_to_ns(value: Any) -> Optional[int]:
-    """Best-effort conversion of an epoch timestamp of unknown unit to ns.
-
-    Copilot's hooks reference documents `timestamp: number` without a unit.
-    Bucket by magnitude (valid across seconds/ms/us/ns for any date in the
-    2020s-2030s) rather than assuming one unit and silently mis-scaling
-    durations.
-    """
+    """Best-effort conversion of an epoch timestamp of unknown unit to ns."""
+    
     try:
         value = float(value)
     except (TypeError, ValueError):
@@ -95,13 +78,7 @@ def _set_attrs(span: Any, attrs: Dict[str, Any]) -> None:
 
 
 def _clamped_end(span: Any, end_ns: int) -> int:
-    """Never let a span end before it started.
-
-    Events are ordered by local ``received_at`` but timed by their own
-    ``timestamp`` field (a different clock), so a close event can carry a
-    timestamp earlier than its open event -- which would otherwise produce a
-    negative-duration span. Floor the end at the span's start.
-    """
+    """Never let a span end before it started."""
     start = getattr(span, "start_time_ns", None)
     if isinstance(start, int) and end_ns < start:
         return start
@@ -131,11 +108,8 @@ def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str,
 
     session_span: Optional[Any] = None
     tool_queues: Dict[str, Deque[Any]] = defaultdict(deque)
-    # subagentStart does not provide agentId, while subagentStop does. Match
-    # on agentName and queue starts so normal completions (and same-name
-    # concurrent agents) are paired correctly.
     subagent_spans: Dict[str, Deque[Any]] = defaultdict(deque)
-    open_spans: List[Any] = []  # innermost-open-last, for errorOccurred attribution
+    open_spans: List[Any] = [] 
     summary = {"tool_spans": 0, "subagent_spans": 0, "errors": 0}
     last_event_ns: Optional[int] = None
 
@@ -145,8 +119,6 @@ def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str,
         queue = subagent_spans.get(key) if key else None
         if queue:
             return queue.popleft()
-        # Older fixtures/clients may only send agentId at stop time. There is
-        # no way to map that id to a start, so only use it when unambiguous.
         if payload.get("agentId"):
             candidates = [q for q in subagent_spans.values() if q]
             if len(candidates) == 1:
@@ -157,10 +129,7 @@ def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str,
         nonlocal session_span
         if session_span is not None:
             return session_span
-        # A tool/subagent event arrived with no sessionStart in this session's
-        # log (e.g. hooks were only just enabled mid-session) -- open a
-        # session span anyway so the event has somewhere to attach rather
-        # than being silently dropped.
+        
         attrs = mapping.start_attributes("sessionStart", payload)
         attrs["github_copilot.session.source"] = "recovered_missing_session_start"
         attrs.update(_vcs_attributes(payload.get("cwd")))
@@ -207,9 +176,6 @@ def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str,
             queue = tool_queues[tool_name]
             span = queue.popleft() if queue else None
             if span is None:
-                # postToolUse(Failure) with no matching preToolUse captured in
-                # this session's log -- open+close a zero-duration span so the
-                # event isn't silently dropped.
                 parent = ensure_session_span(payload, start_ns)
                 span = tracer.start_span(
                     mapping.span_name_for(event_name, payload),
@@ -258,15 +224,14 @@ def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str,
                 error = payload.get("error") or {}
                 message = error.get("message") if isinstance(error, dict) else str(error)
                 err_type = error.get("type") if isinstance(error, dict) else None
-                # add_event() attaches straight to the OTel span, bypassing
-                # _set_attrs()'s redact_attributes() call -- redact explicitly
-                # here so an error message containing e.g. an email doesn't
-                # slip through unredacted the way a regular attribute wouldn't.
-                # (strip_content_fields already redacted this before persistence;
-                # this is belt-and-suspenders for the direct-call path in tests.)
                 event_attrs = {"error.message": redact_string((message or "")[:200])}
                 if err_type:
                     event_attrs["error.type"] = str(err_type)[:200]
+                ctx = payload.get("errorContext")
+                if isinstance(ctx, dict) and ctx.get("_stripped"):
+                    event_attrs["error.context.length"] = ctx.get("length")
+                elif isinstance(ctx, str) and ctx:
+                    event_attrs["error.context"] = redact_string(ctx[:200])
                 target.add_event(
                     "github_copilot.error",
                     event_attrs,
@@ -290,12 +255,6 @@ def build_trace(tracer: Any, events: List[Dict[str, Any]]) -> Optional[Dict[str,
             session_span.end(end_time=_clamped_end(session_span, start_ns))
             _discard(open_spans, session_span)
 
-        # IGNORED_EVENTS and unrecognized event names: intentionally no-op.
-
-    # Safety net: close anything still open (e.g. sessionEnd never arrived) so
-    # a flush always yields a complete, exportable trace, never dangling spans.
-    # Use the last observed event time, not time.time_ns(): a session recovered
-    # by `flush --all` hours later must not get an hours-long bogus duration.
     for span in reversed(open_spans):
         try:
             if last_event_ns is not None:

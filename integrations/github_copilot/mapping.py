@@ -1,10 +1,5 @@
-"""Pure mapping from GitHub Copilot hook events to Traccia span shape.
+"""Pure mapping from GitHub Copilot hook events to Traccia span shape."""
 
-No I/O here -- keeps this module trivially unit-testable in isolation from
-the hook subprocess, the local session log, and the tracer. See
-docs/github-copilot-integration.md for the full event -> span table and the
-exact field names sourced from GitHub's hooks reference.
-"""
 from __future__ import annotations
 
 import json
@@ -20,15 +15,10 @@ SESSION_END_EVENTS = frozenset({"sessionEnd"})
 TOOL_END_EVENTS = frozenset({"postToolUse", "postToolUseFailure"})
 SUBAGENT_END_EVENTS = frozenset({"subagentStop"})
 
-# Events recorded as a span *event* on the session span, but that never open
-# or close a span of their own.
 SESSION_EVENT_ONLY = frozenset(
     {"preCompact", "userPromptSubmitted", "userPromptTransformed"}
 )
 
-# Events buffered for completeness but with no tracing value -- intentionally
-# not turned into spans or span events, to avoid an explosion of low-value
-# noise (see docs/github-copilot-integration.md limitations).
 IGNORED_EVENTS = frozenset({"agentStop", "notification", "permissionRequest"})
 
 ALL_KNOWN_EVENTS = (
@@ -43,22 +33,20 @@ ALL_KNOWN_EVENTS = (
     | {"errorOccurred"}
 )
 
-# Fields that hold free-text content (prompts, code, tool I/O) per event,
-# stripped to length-only unless capture_content is enabled.
+
 _CONTENT_FIELDS_BY_EVENT: Dict[str, tuple] = {
     "sessionStart": ("initialPrompt",),
     "preToolUse": ("toolArgs",),
-    "postToolUse": ("toolResult",),
+    "postToolUse": ("toolArgs",),
+    "postToolUseFailure": ("toolArgs",),
     "subagentStop": ("response",),
     "userPromptSubmitted": ("prompt",),
     "userPromptTransformed": ("prompt", "transformedPrompt"),
     "subagentStart": ("agentDescription",),
     "preCompact": ("customInstructions",),
+    "errorOccurred": ("errorContext",),
 }
 
-# Keep the on-disk journal intentionally narrow. Copilot may add fields to a
-# payload over time; unknown fields must not become an accidental content
-# capture channel.
 _SAFE_FIELDS_BY_EVENT: Dict[str, frozenset] = {
     "sessionStart": frozenset({"sessionId", "timestamp", "cwd", "source", "initialPrompt"}),
     "sessionEnd": frozenset({"sessionId", "timestamp", "cwd", "reason"}),
@@ -101,17 +89,34 @@ def _safe_text(value: Any) -> str:
         return str(value)[:_MAX_CONTENT_CHARS]
 
 
+def _capture_or_length(raw: Any, capture_content: bool) -> Any:
+    """Reduce one content value for on-disk persistence."""
+    if capture_content:
+        from traccia.processors.redaction_processor import redact_string
+
+        return redact_string(_safe_text(raw))
+    return {"_stripped": True, "length": _length_of(raw)}
+
+
+def _strip_result_object(value: Any, capture_content: bool) -> Any:
+    """Sanitize Copilot's structured ``toolResult``."""
+    if not isinstance(value, dict):
+        return _capture_or_length(value, capture_content)
+    out: Dict[str, Any] = {}
+    result_type = value.get("resultType")
+    if result_type is not None:
+        out["resultType"] = str(result_type)[:_MAX_ERROR_CHARS]
+    text = value.get("textResultForLlm")
+    if text is not None:
+        out["textResultForLlm"] = _capture_or_length(text, capture_content)
+    return out
+
+
 def strip_content_fields(
     event_name: str, payload: Dict[str, Any], capture_content: bool
 ) -> Dict[str, Any]:
-    """Return a copy of `payload` with content-bearing fields stripped or capped.
-
-    Called before an event is ever written to the local session log, so with
-    capture_content=False the raw content never touches disk in the first
-    place. After this call, every field named in _CONTENT_FIELDS_BY_EVENT is
-    either ``{"_stripped": True, "length": N}`` or an already size-capped
-    plain string -- callers never need to re-truncate.
-    """
+    """Return a copy of `payload` with content-bearing fields stripped or capped."""
+    
     payload = {
         key: value
         for key, value in dict(payload or {}).items()
@@ -120,11 +125,10 @@ def strip_content_fields(
     for field in _CONTENT_FIELDS_BY_EVENT.get(event_name, ()):
         if field not in payload or payload[field] is None:
             continue
-        raw = payload[field]
-        if capture_content:
-            payload[field] = _safe_text(raw)
-        else:
-            payload[field] = {"_stripped": True, "length": _length_of(raw)}
+        payload[field] = _capture_or_length(payload[field], capture_content)
+
+    if event_name == "postToolUse" and payload.get("toolResult") is not None:
+        payload["toolResult"] = _strip_result_object(payload["toolResult"], capture_content)
 
     error = payload.get("error")
     if error is not None:
@@ -134,9 +138,6 @@ def strip_content_fields(
         else:
             message = str(error)
             err_type = None
-        # Error text lands in the on-disk session log, so scrub PII here rather
-        # than only at span-build time -- a tool stack trace can carry a path,
-        # token or email. Lazy import keeps the (error-free) hot path lean.
         from traccia.processors.redaction_processor import redact_string
 
         cleaned: Dict[str, Any] = {
@@ -262,15 +263,22 @@ def end_attributes(event_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if event_name == "postToolUse":
         result = payload.get("toolResult")
         if isinstance(result, dict) and not result.get("_stripped"):
-            text = result.get("textResultForLlm")
-            if text is not None:
-                attrs["agent.tool.output"] = _safe_text(text)
             result_type = result.get("resultType")
             if result_type:
                 attrs["agent.tool.result_type"] = result_type
+            text = result.get("textResultForLlm")
+            preview = _content_value(text)
+            length = _content_length(text)
+            if preview is not None:
+                attrs["agent.tool.output"] = _safe_text(preview)
+            elif length is not None:
+                attrs["agent.tool.output.length"] = length
         else:
+            preview = _content_value(result)
             length = _content_length(result)
-            if length is not None:
+            if preview is not None:
+                attrs["agent.tool.output"] = _safe_text(preview)
+            elif length is not None:
                 attrs["agent.tool.output.length"] = length
 
     elif event_name == "postToolUseFailure":
