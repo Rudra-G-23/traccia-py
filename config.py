@@ -384,15 +384,7 @@ class TracciaConfig(BaseModel):
             "max_span_depth": self.instrumentation.max_span_depth,
             "openai_agents": self.instrumentation.openai_agents,
             "crewai": self.instrumentation.crewai,
-            "github_copilot": self.instrumentation.github_copilot,
-            "github_copilot_capture_content": self.instrumentation.github_copilot_capture_content,
-            # NOTE: github_copilot_state_dir is intentionally NOT included here.
-            # Unlike the other instrumentation flags, it's never consumed by
-            # start_tracing() -- the hook/flush subprocesses read it straight
-            # from sdk_config.load_config() (see integrations/github_copilot/state.py),
-            # since they never call init()/start_tracing() themselves. Adding it
-            # here would make init() forward it to start_tracing(**merged_config),
-            # which doesn't accept that kwarg and would raise TypeError.
+            # GitHub Copilot settings are consumed only by hook subprocesses.
             "guardrail_heuristics": self.instrumentation.guardrail_heuristics,
             # Rate limiting & Batching
             "max_spans_per_second": self.rate_limiting.max_spans_per_second,
@@ -800,10 +792,6 @@ def load_config_with_priority(
             "max_span_depth": ("instrumentation", "max_span_depth"),
             "openai_agents": ("instrumentation", "openai_agents"),
             "crewai": ("instrumentation", "crewai"),
-            "github_copilot": ("instrumentation", "github_copilot"),
-            "github_copilot_capture_content": ("instrumentation", "github_copilot_capture_content"),
-            # github_copilot_state_dir deliberately excluded -- see the matching
-            # note in to_dict() above.
             "guardrail_heuristics": ("instrumentation", "guardrail_heuristics"),
             # Rate limiting & Batching
             "max_spans_per_second": ("rate_limiting", "max_spans_per_second"),

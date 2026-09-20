@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -12,39 +13,21 @@ VSCODE_PREFIX = "github.copilot.chat.otel"
 # The path Copilot's exporter appends to its base endpoint for trace export.
 STANDARD_TRACES_PATH = "/v1/traces"
 
-# Where the rendered config tells Copilot to send spans when a Collector bridge is needed
-LOCAL_COLLECTOR_ENDPOINT = "http://localhost:4318"
-
-
 @dataclass(frozen=True)
 class NativeOtelConfig:
     """Resolved inputs for rendering Copilot's native OTLP settings."""
 
     endpoint: str
-    """The Traccia traces endpoint spans must ultimately reach."""
+    """The normalized OTLP traces endpoint Copilot exports to."""
 
     base: str
-    """``endpoint`` with a trailing ``/v1/traces`` removed, else ``endpoint``."""
+    """``endpoint`` with its trailing ``/v1/traces`` removed."""
 
-    path_compatible: bool
-    """True when ``base`` + ``/v1/traces`` reproduces ``endpoint`` -- i.e.
-    Copilot can be pointed straight at it with no Collector."""
-
-    api_key: Optional[str]
+    api_key_present: bool
     capture_content: bool
     max_attribute_size_chars: Optional[int] = None
     service_name: Optional[str] = None
     resource_attributes: Optional[Dict[str, str]] = None
-
-    @property
-    def needs_collector(self) -> bool:
-        return not self.path_compatible
-
-    @property
-    def copilot_endpoint(self) -> str:
-        """The base endpoint Copilot itself should target."""
-        return self.base if self.path_compatible else LOCAL_COLLECTOR_ENDPOINT
-
 
 def resolve(
     endpoint: str,
@@ -55,18 +38,12 @@ def resolve(
     service_name: Optional[str] = None,
     resource_attributes: Optional[Dict[str, str]] = None,
 ) -> NativeOtelConfig:
-    endpoint = endpoint.rstrip("/")
-    if endpoint.endswith(STANDARD_TRACES_PATH):
-        base = endpoint[: -len(STANDARD_TRACES_PATH)]
-        compatible = True
-    else:
-        base = endpoint
-        compatible = False
+    endpoint = _normalize_endpoint(endpoint)
+    _validate_endpoint(endpoint)
     return NativeOtelConfig(
         endpoint=endpoint,
-        base=base,
-        path_compatible=compatible,
-        api_key=api_key or None,
+        base=endpoint[: -len(STANDARD_TRACES_PATH)],
+        api_key_present=bool(api_key),
         capture_content=bool(capture_content),
         max_attribute_size_chars=max_attribute_size_chars,
         service_name=service_name or None,
@@ -74,11 +51,42 @@ def resolve(
     )
 
 
+def _normalize_endpoint(endpoint: str) -> str:
+    """Convert Traccia's legacy traces path to Copilot's OTLP path."""
+    endpoint = endpoint.rstrip("/")
+    if endpoint.endswith("/v2/traces"):
+        endpoint = endpoint[: -len("/v2/traces")] + STANDARD_TRACES_PATH
+    if not endpoint.endswith(STANDARD_TRACES_PATH):
+        raise ValueError(
+            "Copilot native OpenTelemetry requires an OTLP HTTP traces endpoint "
+            "ending in '/v1/traces'."
+        )
+    return endpoint
+
+
+def _validate_endpoint(endpoint: str) -> None:
+    """Reject malformed and insecure remote endpoints."""
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Endpoint must be an absolute HTTP or HTTPS URL.")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise ValueError("Remote endpoints must use HTTPS. HTTP is allowed only for loopback hosts.")
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 def vscode_settings(cfg: NativeOtelConfig) -> Dict[str, object]:
     """The ``github.copilot.chat.otel.*`` keys for ``.vscode/settings.json``.
 
-    ``otlpEndpoint`` is Copilot's own target: the Traccia endpoint when it is
-    ``/v1/traces``-shaped, otherwise the local Collector that forwards there.
+    ``otlpEndpoint`` is Copilot's own target: the base URL of the normalized
+    ``/v1/traces`` endpoint.
     Authentication headers are configured through
     ``OTEL_EXPORTER_OTLP_HEADERS`` rather than workspace settings, so secrets
     are not written to a repository file.
@@ -87,7 +95,7 @@ def vscode_settings(cfg: NativeOtelConfig) -> Dict[str, object]:
         f"{VSCODE_PREFIX}.enabled": True,
         f"{VSCODE_PREFIX}.exporterType": "otlp-http",
         f"{VSCODE_PREFIX}.protocol": "http/protobuf",
-        f"{VSCODE_PREFIX}.otlpEndpoint": cfg.copilot_endpoint,
+        f"{VSCODE_PREFIX}.otlpEndpoint": cfg.base,
         f"{VSCODE_PREFIX}.captureContent": cfg.capture_content,
     }
     if cfg.max_attribute_size_chars is not None:
@@ -102,8 +110,8 @@ def file_exporter_vscode_settings(
 ) -> Dict[str, object]:
     """``github.copilot.chat.otel.*`` keys for the local file-exporter fallback.
 
-    For environments where a Collector endpoint isn't reachable, Copilot can
-    write spans to a local JSONL file instead of exporting over the network.
+    Copilot can write spans to a local JSONL file instead of exporting over the
+    network.
     Nothing forwards this file to Traccia automatically -- it's a manual or
     scripted pickup, e.g. the "Chat: Export Agent Traces DB" command mirrors
     it in the CLI via `dbSpanExporter`.
@@ -128,11 +136,11 @@ def env_vars(cfg: NativeOtelConfig) -> Dict[str, str]:
     """
     env: Dict[str, str] = {
         "COPILOT_OTEL_ENABLED": "true",
-        "OTEL_EXPORTER_OTLP_ENDPOINT": cfg.copilot_endpoint,
+        "OTEL_EXPORTER_OTLP_ENDPOINT": cfg.base,
         "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
     }
-    if cfg.path_compatible and cfg.api_key:
-        env["OTEL_EXPORTER_OTLP_HEADERS"] = f"Authorization=Bearer {cfg.api_key}"
+    if cfg.api_key_present:
+        env["OTEL_EXPORTER_OTLP_HEADERS"] = "Authorization=Bearer ${TRACCIA_API_KEY}"
     if cfg.capture_content:
         env["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = "true"
     if cfg.service_name:
@@ -142,39 +150,6 @@ def env_vars(cfg: NativeOtelConfig) -> Dict[str, str]:
             f"{k}={v}" for k, v in cfg.resource_attributes.items()
         )
     return env
-
-
-def collector_config(cfg: NativeOtelConfig) -> str:
-    """A minimal OpenTelemetry Collector config bridging Copilot to Traccia.
-
-    Empty string when no bridge is needed.
-    """
-    if cfg.path_compatible:
-        return ""
-    auth = (
-        '      Authorization: "Bearer ${env:TRACCIA_API_KEY}"'
-        if not cfg.api_key
-        else f'      Authorization: "Bearer {cfg.api_key}"'
-    )
-    return "\n".join(
-        [
-            "receivers:",
-            "  otlp:",
-            "    protocols:",
-            "      http:",
-            "        endpoint: 0.0.0.0:4318",
-            "exporters:",
-            "  otlphttp/traccia:",
-            f"    traces_endpoint: {cfg.endpoint}",
-            "    headers:",
-            auth,
-            "service:",
-            "  pipelines:",
-            "    traces:",
-            "      receivers: [otlp]",
-            "      exporters: [otlphttp/traccia]",
-        ]
-    )
 
 
 def merge_settings(
@@ -214,20 +189,15 @@ def merge_into_vscode_settings(
 def warnings(cfg: NativeOtelConfig) -> List[str]:
     """Caveats a user should see before applying the rendered config."""
     notes: List[str] = []
-    if cfg.needs_collector:
-        path = urlsplit(cfg.endpoint).path or "/"
+    if not cfg.api_key_present:
         notes.append(
-            f"Copilot appends '/v1/traces' to its base endpoint on both VS Code "
-            f"and the CLI, but Traccia ingests at '{path}'. The rendered config "
-            f"points Copilot at a local Collector ({LOCAL_COLLECTOR_ENDPOINT}); "
-            "run one with the printed config, or add a '/v1/traces' route to "
-            "your ingest."
+            "No API key resolved. Set TRACCIA_API_KEY before starting Copilot, "
+            "or pass --api-key to verify that authentication is configured."
         )
-    if not cfg.api_key:
+    else:
         notes.append(
-            "No API key resolved. Set tracing.api_key (or TRACCIA_API_KEY), or "
-            "pass --api-key. The Collector config falls back to "
-            "${env:TRACCIA_API_KEY} at run time."
+            "Set TRACCIA_API_KEY securely before starting Copilot. The rendered "
+            "header deliberately references that environment variable."
         )
     if cfg.capture_content:
         notes.append(

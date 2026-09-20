@@ -784,28 +784,21 @@ def _copilot_setup_otel(args: argparse.Namespace) -> int:
     resource_attributes = dict(
         pair.split("=", 1) for pair in (args.resource_attribute or [])
     )
-    cfg = native_otel.resolve(
-        endpoint,
-        api_key,
-        args.capture_content,
-        max_attribute_size_chars=args.max_attribute_size_chars,
-        service_name=args.service_name,
-        resource_attributes=resource_attributes or None,
-    )
+    try:
+        cfg = native_otel.resolve(
+            endpoint,
+            api_key,
+            args.capture_content,
+            max_attribute_size_chars=args.max_attribute_size_chars,
+            service_name=args.service_name,
+            resource_attributes=resource_attributes or None,
+        )
+    except ValueError as exc:
+        print(f"Invalid Copilot OTLP endpoint: {exc}", file=sys.stderr)
+        return 1
 
     show_vscode = args.format in ("both", "vscode")
     show_env = args.format in ("both", "env")
-
-    if cfg.needs_collector:
-        print(
-            f"Traccia ingests at {cfg.endpoint}; Copilot only sends to "
-            "<base>/v1/traces. Run this OpenTelemetry Collector to bridge:\n"
-        )
-        print(native_otel.collector_config(cfg))
-        print(
-            f"\nThen Copilot points at {native_otel.LOCAL_COLLECTOR_ENDPOINT} "
-            "and the Collector forwards to Traccia.\n"
-        )
 
     if show_vscode:
         print("VS Code -- merge into .vscode/settings.json:\n")
@@ -1096,9 +1089,8 @@ For more information, visit: https://github.com/traccia-ai/traccia
         choices=["otlp-http", "file"],
         default="otlp-http",
         help=(
-            "otlp-http (default) routes through Traccia/a Collector; file "
-            "writes Copilot's spans to a local JSONL file instead, for "
-            "environments with no reachable Collector endpoint"
+            "otlp-http (default) exports directly to Traccia; file writes "
+            "Copilot's spans to a local JSONL file instead"
         ),
     )
     copilot_otel.add_argument(

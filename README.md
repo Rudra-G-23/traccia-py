@@ -235,7 +235,7 @@ init(crewai=False)  # Explicit parameter
 
 ### GitHub Copilot
 
-GitHub Copilot (CLI and the cloud coding agent) runs as its own external process, not Python code you import - so unlike the integrations above, it uses [Copilot's hooks](https://docs.github.com/en/copilot/reference/hooks-reference): Traccia registers gets invoked at lifecycle events (session start/end, each tool call, subagent runs) and turns them into Traccia spans.
+GitHub Copilot (CLI and the cloud coding agent) runs as its own external process, not Python code you import - so unlike the integrations above, it uses [Copilot's hooks](https://docs.github.com/en/copilot/reference/hooks-reference): Traccia is invoked at lifecycle events (session start/end, each tool call, subagent runs) and turns them into Traccia spans. For a complete first-time setup, see [GitHub Copilot setup](docs/GITHUB_COPILOT_SETUP.md).
 
 ```bash
 pip install traccia   # no extra required
@@ -265,20 +265,26 @@ Run it alongside `install-hooks`; the two pipelines correlate on session id and 
 
 Copilot's exporter uses standard OTLP HTTP signal paths: `/v1/traces` and
 `/v1/metrics`. The Traccia platform supports these paths directly, so
-`setup-otel` uses `https://api.traccia.ai/v1/traces` by default and no Collector
-is required. For a custom endpoint that does not provide standard `/v1` signal
-paths, `setup-otel` renders an OpenTelemetry Collector bridge instead. Export
-`OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer <api-key>"` before launching
-VS Code or Copilot CLI so the exporter can authenticate. CLI terminal traces
-arrive as their own root spans under service `github-copilot`.
+`setup-otel` uses `https://api.traccia.ai/v1/traces` by default. A configured
+Traccia `/v2/traces` endpoint is normalized automatically. Custom endpoints
+must provide `/v1/traces` and use HTTPS, except for loopback development
+addresses. Set `TRACCIA_API_KEY` securely before launching VS Code or Copilot
+CLI; the command never prints the API key. CLI terminal traces arrive as their
+own root spans under service `github-copilot`.
 
 **Configuration**: Auto-enabled by default. To disable:
 
-```python
-init(github_copilot=False)  # Explicit parameter
-# OR set environment variable: TRACCIA_GITHUB_COPILOT=false
-# OR in traccia.toml under [instrumentation]: github_copilot = false
+```toml
+# traccia.toml
+[instrumentation]
+github_copilot = false
 ```
+
+Or set `TRACCIA_GITHUB_COPILOT=false` in the environment used by Copilot's hook
+process. `traccia.init()` does not configure hooks because Copilot runs them in
+a separate process. When a session ends, Traccia's internal flush process calls
+plain `traccia.init()` only to initialize the exporter for the completed session
+spans.
 
 ---
 

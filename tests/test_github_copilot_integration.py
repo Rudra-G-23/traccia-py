@@ -13,12 +13,13 @@ import json
 import time
 from unittest.mock import patch
 
+import pytest
+
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from traccia.integrations.github_copilot import flush as flush_mod
 from traccia.integrations.github_copilot import hook as hook_mod
-from traccia.integrations.github_copilot import install as install_fn
 from traccia.integrations.github_copilot import mapping
 from traccia.integrations.github_copilot import native_otel
 from traccia.integrations.github_copilot import spans as spans_mod
@@ -467,7 +468,11 @@ def test_flush_session_inits_and_tears_down_fresh_provider(tmp_path):
     ) as mock_flush, patch("traccia.stop_tracing") as mock_stop:
         result = flush_mod.flush_session("s1", state_dir=tmp_path)
 
-    mock_init.assert_called_once()
+    mock_init.assert_called_once_with(
+        auto_start_trace=False,
+        openai_agents=False,
+        crewai=False,
+    )
     mock_end_auto.assert_called_once()  # guards against init()'s auto-trace-priority quirk -- see flush.py
     mock_get_tracer.assert_called_once_with("github_copilot")
     mock_flush.assert_called_once()
@@ -515,29 +520,6 @@ def test_flush_all_flushes_old_sessions(tmp_path):
 
     mock_flush_one.assert_called_once()
     assert results == {"old": {"tool_spans": 0}}
-
-
-# ---------------------------------------------------------------------------
-# __init__.py -- install()
-# ---------------------------------------------------------------------------
-
-
-def test_install_enabled_by_default():
-    assert install_fn() is True
-
-
-def test_install_explicit_disable():
-    assert install_fn(enabled=False) is False
-
-
-def test_install_disabled_via_runtime_config():
-    from traccia import runtime_config
-
-    runtime_config.set_config_value("github_copilot", False)
-    try:
-        assert install_fn(enabled=None) is False
-    finally:
-        runtime_config.set_config_value("github_copilot", None)
 
 
 # ---------------------------------------------------------------------------
@@ -991,22 +973,25 @@ def test_flush_session_salvages_late_events_instead_of_full_reexport(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_native_otel_resolve_standard_path_is_compatible():
+def test_native_otel_resolve_standard_path_uses_its_base_url():
     cfg = native_otel.resolve("http://localhost:4318/v1/traces", "k", False)
     assert cfg.base == "http://localhost:4318"
-    assert cfg.path_compatible is True
-    assert cfg.needs_collector is False
-    assert cfg.copilot_endpoint == "http://localhost:4318"
 
 
-def test_native_otel_resolve_nonstandard_path_needs_collector():
+def test_native_otel_normalizes_traccia_v2_path():
     cfg = native_otel.resolve("https://api.traccia.ai/v2/traces/", "k", False)
-    assert cfg.endpoint == "https://api.traccia.ai/v2/traces"  # trailing slash trimmed
-    assert cfg.base == "https://api.traccia.ai/v2/traces"
-    assert cfg.path_compatible is False
-    assert cfg.needs_collector is True
-    # Copilot is aimed at the local Collector, not straight at Traccia
-    assert cfg.copilot_endpoint == native_otel.LOCAL_COLLECTOR_ENDPOINT
+    assert cfg.endpoint == "https://api.traccia.ai/v1/traces"
+    assert cfg.base == "https://api.traccia.ai"
+
+
+def test_native_otel_rejects_non_otlp_and_insecure_remote_endpoints():
+    with pytest.raises(ValueError, match="/v1/traces"):
+        native_otel.resolve("https://otel.example.test/custom", "k", False)
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        native_otel.resolve("http://otel.example.test/v1/traces", "k", False)
+    assert native_otel.resolve("http://[::1]:4318/v1/traces", "k", False).base == (
+        "http://[::1]:4318"
+    )
 
 
 def test_native_otel_vscode_settings_direct_endpoint_carries_auth():
@@ -1018,11 +1003,10 @@ def test_native_otel_vscode_settings_direct_endpoint_carries_auth():
     assert "github.copilot.chat.otel.headers" not in s
 
 
-def test_native_otel_vscode_settings_collector_case_targets_localhost_no_auth():
-    # Auth to Traccia lives on the Collector, so Copilot's own settings omit it.
+def test_native_otel_vscode_settings_normalizes_v2_to_direct_endpoint():
     cfg = native_otel.resolve("https://api.traccia.ai/v2/traces", "secret", False)
     s = native_otel.vscode_settings(cfg)
-    assert s["github.copilot.chat.otel.otlpEndpoint"] == native_otel.LOCAL_COLLECTOR_ENDPOINT
+    assert s["github.copilot.chat.otel.otlpEndpoint"] == "https://api.traccia.ai"
     assert "github.copilot.chat.otel.headers" not in s
 
 
@@ -1032,32 +1016,16 @@ def test_native_otel_env_vars_use_base_endpoint_not_per_signal():
     # Copilot has no supported per-signal override; it appends /v1/traces itself
     assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://localhost:4318"
     assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in env
-    assert env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer k"
+    assert env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer ${TRACCIA_API_KEY}"
     assert env["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] == "true"
 
 
-def test_native_otel_env_vars_collector_case_omits_traccia_auth():
+def test_native_otel_env_vars_normalizes_v2_without_leaking_the_key():
     cfg = native_otel.resolve("https://api.traccia.ai/v2/traces", "k", False)
     env = native_otel.env_vars(cfg)
-    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == native_otel.LOCAL_COLLECTOR_ENDPOINT
-    assert "OTEL_EXPORTER_OTLP_HEADERS" not in env
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "https://api.traccia.ai"
+    assert env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer ${TRACCIA_API_KEY}"
     assert "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT" not in env
-
-
-def test_native_otel_collector_config_renders_endpoint_and_key():
-    cfg = native_otel.resolve("https://api.traccia.ai/v2/traces", "sekret", False)
-    yaml = native_otel.collector_config(cfg)
-    assert "traces_endpoint: https://api.traccia.ai/v2/traces" in yaml
-    assert 'Authorization: "Bearer sekret"' in yaml
-    assert "endpoint: 0.0.0.0:4318" in yaml
-    # no key -> falls back to an env reference
-    assert 'Bearer ${env:TRACCIA_API_KEY}' in native_otel.collector_config(
-        native_otel.resolve("https://api.traccia.ai/v2/traces", None, False)
-    )
-    # compatible endpoint -> no bridge needed
-    assert native_otel.collector_config(
-        native_otel.resolve("http://localhost:4318/v1/traces", "k", False)
-    ) == ""
 
 
 def test_native_otel_merge_leaves_unrelated_and_conflicting_keys():
@@ -1086,19 +1054,19 @@ def test_native_otel_merge_idempotent():
     assert twice == once
 
 
-def test_native_otel_warnings_flag_collector_key_and_capture():
+def test_native_otel_warnings_flag_missing_key_and_capture():
     notes = native_otel.warnings(
         native_otel.resolve("https://api.traccia.ai/v2/traces", None, True)
     )
     joined = " ".join(notes)
     assert "API key" in joined
-    assert "/v1/traces" in joined and "Collector" in joined  # bridge is required
-    assert "VS Code and the CLI" in joined  # applies to both surfaces
     assert "Content capture is ON" in joined
 
-    assert native_otel.warnings(
-        native_otel.resolve("http://localhost:4318/v1/traces", "k", False)
-    ) == []
+    assert "TRACCIA_API_KEY" in " ".join(
+        native_otel.warnings(
+            native_otel.resolve("http://localhost:4318/v1/traces", "k", False)
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1127,19 +1095,26 @@ def _run_setup_otel(argv, monkeypatch, capsys):
     return rc, capsys.readouterr()
 
 
-def test_cli_setup_otel_v2_endpoint_prints_collector_bridge(monkeypatch, capsys):
+def test_cli_setup_otel_normalizes_v2_endpoint_without_printing_the_key(monkeypatch, capsys):
     rc, out = _run_setup_otel(
         ["--endpoint", "https://api.traccia.ai/v2/traces", "--api-key", "k1"],
         monkeypatch,
         capsys,
     )
     assert rc == 0
-    # Collector bridge is rendered, and Copilot is aimed at localhost
-    assert "traces_endpoint: https://api.traccia.ai/v2/traces" in out.out
-    assert '"github.copilot.chat.otel.otlpEndpoint": "http://localhost:4318"' in out.out
-    assert 'export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"' in out.out
+    assert '"github.copilot.chat.otel.otlpEndpoint": "https://api.traccia.ai"' in out.out
+    assert 'export OTEL_EXPORTER_OTLP_ENDPOINT="https://api.traccia.ai"' in out.out
+    assert 'export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer ${TRACCIA_API_KEY}"' in out.out
+    assert "k1" not in out.out
     assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in out.out
-    assert "Collector" in out.err  # the caveat names both surfaces
+    assert "Collector" not in out.out
+
+
+def test_cli_setup_otel_normalizes_configured_v2_endpoint(monkeypatch, capsys):
+    monkeypatch.setattr(_FakeConfig.tracing, "endpoint", "https://api.traccia.ai/v2/traces")
+    rc, out = _run_setup_otel(["--api-key", "k1", "--format", "env"], monkeypatch, capsys)
+    assert rc == 0
+    assert 'export OTEL_EXPORTER_OTLP_ENDPOINT="https://api.traccia.ai"' in out.out
 
 
 def test_cli_setup_otel_v1_endpoint_targets_traccia_directly(monkeypatch, capsys):
@@ -1152,7 +1127,17 @@ def test_cli_setup_otel_v1_endpoint_targets_traccia_directly(monkeypatch, capsys
     assert "OpenTelemetry Collector" not in out.out
     assert '"github.copilot.chat.otel.otlpEndpoint": "https://api.traccia.ai"' in out.out
     assert 'export OTEL_EXPORTER_OTLP_ENDPOINT="https://api.traccia.ai"' in out.out
-    assert 'export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer k1"' in out.out
+    assert 'export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer ${TRACCIA_API_KEY}"' in out.out
+
+
+def test_cli_setup_otel_rejects_insecure_remote_endpoint(monkeypatch, capsys):
+    rc, out = _run_setup_otel(
+        ["--endpoint", "http://otel.example.test/v1/traces", "--api-key", "k1"],
+        monkeypatch,
+        capsys,
+    )
+    assert rc == 1
+    assert "must use HTTPS" in out.err
 
 
 def test_cli_setup_otel_writes_and_preserves_vscode_settings(monkeypatch, capsys, tmp_path):

@@ -28,7 +28,6 @@ def _export_events(events: List[Dict[str, Any]]) -> tuple[Optional[Dict[str, Any
             auto_start_trace=False,
             openai_agents=False,
             crewai=False,
-            github_copilot=False,
         )
         
         traccia.end_auto_trace()
