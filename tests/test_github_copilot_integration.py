@@ -69,6 +69,45 @@ def test_span_name_for_tool_and_subagent_and_session():
     assert mapping.span_name_for("preCompact", {}) == "github_copilot.preCompact"
 
 
+def test_normalize_vscode_session_start_payload():
+    event_name, payload = mapping.normalize_payload(
+        "SessionStart",
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "s1",
+            "initial_prompt": "inspect the project",
+        },
+    )
+    assert event_name == "sessionStart"
+    assert payload == {
+        "sessionId": "s1",
+        "initialPrompt": "inspect the project",
+    }
+
+
+def test_normalize_vscode_tool_result_payload():
+    event_name, payload = mapping.normalize_payload(
+        "PostToolUse",
+        {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_result": {
+                "result_type": "success",
+                "text_result_for_llm": "1 passed",
+            },
+        },
+    )
+    assert event_name == "postToolUse"
+    assert payload["toolName"] == "Bash"
+    assert payload["toolArgs"] == {"command": "pytest"}
+    assert payload["toolResult"] == {
+        "resultType": "success",
+        "textResultForLlm": "1 passed",
+    }
+
+
 def test_start_attributes_session_stripped_prompt():
     payload = {
         "sessionId": "s1",
@@ -912,6 +951,75 @@ def test_full_pipeline_hook_to_span_end_to_end(tmp_path):
     session = by_name["github_copilot.session"]
     assert session.attributes["github_copilot.prompt.length"] == len("fix the bug")
     assert session.attributes["github_copilot.session.end_reason"] == "complete"
+
+
+def test_full_pipeline_vscode_hook_to_span_end_to_end(tmp_path):
+    raw = [
+        (
+            "SessionStart",
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "vscode-s1",
+                "timestamp": "2026-09-21T00:00:00Z",
+                "cwd": str(tmp_path),
+                "source": "new",
+                "initial_prompt": "inspect the project",
+            },
+        ),
+        (
+            "PreToolUse",
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "vscode-s1",
+                "timestamp": "2026-09-21T00:00:01Z",
+                "cwd": str(tmp_path),
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest"},
+            },
+        ),
+        (
+            "PostToolUse",
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "vscode-s1",
+                "timestamp": "2026-09-21T00:00:03Z",
+                "cwd": str(tmp_path),
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest"},
+                "tool_result": {
+                    "result_type": "success",
+                    "text_result_for_llm": "1 passed",
+                },
+            },
+        ),
+        (
+            "SessionEnd",
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": "vscode-s1",
+                "timestamp": "2026-09-21T00:00:04Z",
+                "cwd": str(tmp_path),
+                "reason": "complete",
+            },
+        ),
+    ]
+    for event_name, payload in raw:
+        with patch("subprocess.Popen"):
+            rc, out = _run_hook([event_name], json.dumps(payload), tmp_path)
+        assert rc == 0 and json.loads(out) == {}
+
+    events = state.read_events("vscode-s1", state_dir=tmp_path)
+    assert [event["event"] for event in events] == [
+        "sessionStart",
+        "preToolUse",
+        "postToolUse",
+        "sessionEnd",
+    ]
+    tracer, exporter = _make_tracer()
+    summary = spans_mod.build_trace(tracer, events)
+    assert summary == {"tool_spans": 1, "subagent_spans": 0, "errors": 0}
+    by_name = {span.name: span for span in exporter.get_finished_spans()}
+    assert by_name["github_copilot.tool.Bash"].end_time - by_name["github_copilot.tool.Bash"].start_time == 2_000_000_000
 
 
 def test_has_end_event_ignores_session_end_inside_captured_content(tmp_path):

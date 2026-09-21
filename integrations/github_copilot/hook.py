@@ -36,11 +36,12 @@ def _run(argv: List[str]) -> None:
     if not isinstance(payload, dict):
         return
 
+    from traccia.integrations.github_copilot import mapping, state
+
+    event_name, payload = mapping.normalize_payload(event_name, payload)
     session_id = payload.get("sessionId")
     if not session_id:
         return  # nothing to correlate this event to
-
-    from traccia.integrations.github_copilot import mapping, state
 
     if event_name not in mapping.ALL_KNOWN_EVENTS:
         return  # forward-compatible: silently ignore events this version doesn't map yet

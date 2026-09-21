@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -19,6 +20,47 @@ from traccia.config import (
     DEFAULT_OTLP_TRACE_ENDPOINT,
 )
 from traccia.errors import ConfigError
+
+
+def _load_jsonc_object(path: Path) -> dict:
+    """Read a VS Code JSONC object using the standard JSON parser."""
+    text = path.read_text(encoding="utf-8")
+    output = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            index += 1
+        elif char == "/" and index + 1 < len(text) and text[index + 1] == "/":
+            newline = text.find("\n", index + 2)
+            index = len(text) if newline == -1 else newline
+        elif char == "/" and index + 1 < len(text) and text[index + 1] == "*":
+            end = text.find("*/", index + 2)
+            if end == -1:
+                raise ValueError("unterminated block comment")
+            index = end + 2
+        else:
+            output.append(char)
+            index += 1
+    clean = re.sub(r",\s*([}\]])", r"\1", "".join(output))
+    value = json.loads(clean)
+    if not isinstance(value, dict):
+        raise ValueError("settings root is not an object")
+    return value
 
 
 def _check(args) -> int:
@@ -278,11 +320,8 @@ def _doctor_github_copilot_native_otel() -> None:
     vscode_enabled = False
     try:
         if vscode_settings_path.exists():
-            data = json.loads(vscode_settings_path.read_text(encoding="utf-8"))
-            vscode_enabled = bool(
-                isinstance(data, dict)
-                and data.get("github.copilot.chat.otel.enabled")
-            )
+            data = _load_jsonc_object(vscode_settings_path)
+            vscode_enabled = bool(data.get("github.copilot.chat.otel.enabled"))
     except (OSError, ValueError, json.JSONDecodeError):
         pass
 
@@ -348,7 +387,14 @@ def _doctor(args) -> int:
         print(f"   • File Exporter: {'✅ Enabled' if config.exporters.enable_file else '❌ Disabled'}")
         print(f"   • Auto-patching: {'✅ Enabled' if config.instrumentation.enable_patching else '❌ Disabled'}")
         
-        # Check for potential issues (no warning when endpoint is unset — SDK uses default)
+        # Check for potential issues (no warning when endpoint is unset - SDK uses default)
+        if (
+            config.tracing.use_otlp
+            and not config.tracing.api_key
+            and effective_endpoint.startswith("https://api.traccia.ai/")
+        ):
+            print("\n❌ Error: TRACCIA_API_KEY is required for the Traccia platform endpoint.")
+            issues_found += 1
         
         if not config.tracing.use_otlp and not config.exporters.enable_console and not config.exporters.enable_file:
             print("\n❌ Error: No exporter is enabled! Traces won't be exported anywhere.")
@@ -703,9 +749,7 @@ def _write_settings_file(
     existing: dict = {}
     if target.exists():
         try:
-            existing = json.loads(target.read_text(encoding="utf-8"))
-            if not isinstance(existing, dict):
-                raise ValueError("settings root is not an object")
+            existing = _load_jsonc_object(target)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(
                 f"Could not parse {target} ({exc}); merge the block above by hand.",
@@ -1136,6 +1180,7 @@ For more information, visit: https://github.com/traccia-ai/traccia
     copilot_flush.set_defaults(func=_copilot_flush)
 
     args = parser.parse_args(argv)
+    _load_dotenv_if_present()
     return args.func(args)
 
 

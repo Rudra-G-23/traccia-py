@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # Events that open a span.
 SESSION_START_EVENTS = frozenset({"sessionStart"})
@@ -32,6 +32,71 @@ ALL_KNOWN_EVENTS = (
     | IGNORED_EVENTS
     | {"errorOccurred"}
 )
+
+_VSCODE_EVENT_NAMES = {
+    "SessionStart": "sessionStart",
+    "SessionEnd": "sessionEnd",
+    "UserPromptSubmit": "userPromptSubmitted",
+    "UserPromptTransformed": "userPromptTransformed",
+    "PreToolUse": "preToolUse",
+    "PostToolUse": "postToolUse",
+    "PostToolUseFailure": "postToolUseFailure",
+    "Stop": "agentStop",
+    "SubagentStart": "subagentStart",
+    "SubagentStop": "subagentStop",
+    "ErrorOccurred": "errorOccurred",
+    "PreCompact": "preCompact",
+    "Notification": "notification",
+    "PermissionRequest": "permissionRequest",
+}
+
+_VSCODE_FIELD_NAMES = {
+    "session_id": "sessionId",
+    "initial_prompt": "initialPrompt",
+    "tool_name": "toolName",
+    "tool_input": "toolArgs",
+    "tool_result": "toolResult",
+    "transcript_path": "transcriptPath",
+    "agent_id": "agentId",
+    "agent_type": "agentType",
+    "agent_name": "agentName",
+    "agent_display_name": "agentDisplayName",
+    "agent_description": "agentDescription",
+    "last_assistant_message": "response",
+    "stop_reason": "stopReason",
+    "error_context": "errorContext",
+    "custom_instructions": "customInstructions",
+}
+
+_VSCODE_TOOL_RESULT_FIELD_NAMES = {
+    "result_type": "resultType",
+    "text_result_for_llm": "textResultForLlm",
+}
+
+
+def normalize_event_name(event_name: str) -> str:
+    """Map VS Code hook event names to the canonical Copilot CLI names."""
+    return _VSCODE_EVENT_NAMES.get(event_name, event_name)
+
+
+def normalize_payload(event_name: str, payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Normalize VS Code hook fields and event names for the span mapper."""
+    normalized_event = normalize_event_name(event_name)
+    if normalized_event == event_name:
+        return normalized_event, dict(payload)
+
+    normalized: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "hook_event_name":
+            continue
+        normalized_key = _VSCODE_FIELD_NAMES.get(key, key)
+        if normalized_key == "toolResult" and isinstance(value, dict):
+            value = {
+                _VSCODE_TOOL_RESULT_FIELD_NAMES.get(result_key, result_key): result_value
+                for result_key, result_value in value.items()
+            }
+        normalized[normalized_key] = value
+    return normalized_event, normalized
 
 
 _CONTENT_FIELDS_BY_EVENT: Dict[str, tuple] = {

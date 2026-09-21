@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional
 
 from traccia.integrations.github_copilot import mapping
@@ -49,6 +50,21 @@ def _vcs_attributes(cwd: Optional[str]) -> Dict[str, str]:
 
 def _epoch_to_ns(value: Any) -> Optional[int]:
     """Best-effort conversion of an epoch timestamp of unknown unit to ns."""
+
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = float(text)
+        except ValueError:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1_000_000_000)
     
     try:
         value = float(value)
